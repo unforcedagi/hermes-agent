@@ -122,6 +122,19 @@ gateway:
 
 The opt-out applies to **all** send paths — final answers, streamed updates, interim commentary, tool-progress bubbles, and out-of-process cron delivery (`deliver=buzz`).
 
+## Sessions per thread
+
+By default every Buzz thread is its own conversation (session). To make a channel behave as one continuous conversation, list its id under `single_session_channels`: thread replies there join the channel's session (the quoted message is still passed as reply context) and answers post flat in the channel.
+
+```yaml
+gateway:
+  platforms:
+    buzz:
+      extra:
+        single_session_channels:   # env: BUZZ_SINGLE_SESSION_CHANNELS (csv)
+          - 1b667c1f-95c8-45e5-a7cc-1df13b7d0e2a
+```
+
 ## Access control
 
 By default the allow-list is empty, which means every community member who mentions the agent gets a response only if `BUZZ_ALLOW_ALL_USERS=true`; otherwise restrict access by listing npubs or hex pubkeys in `BUZZ_ALLOWED_USERS` (or `allowed_users` in config.yaml). Community membership itself is enforced by the relay — only members can post.

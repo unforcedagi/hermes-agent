@@ -532,6 +532,12 @@ class BuzzAdapter(BasePlatformAdapter):
         _rm_cfg = _setting_or("BUZZ_REQUIRE_MENTION", extra, "require_mention", True)
         self.require_mention = str(_rm_cfg).strip().lower() not in ("false", "0", "no", "off")
         self._reply_to_mode: str = _reply_to_mode(config, extra)
+        # Channels that run as ONE conversation: thread replies share the channel session and answers post flat.
+        # Default (unlisted) = one session per thread.
+        self._single_session_channels: set = {
+            c.strip() for c in _split_csv(_setting_or("BUZZ_SINGLE_SESSION_CHANNELS", extra, "single_session_channels", []))
+            if isinstance(c, str) and c.strip()
+        }
         # Inbound transport: "auto" (WebSocket with poll fallback), "websocket" (required), "poll".
         _transport_raw = _scoped_platform_setting("BUZZ_TRANSPORT", extra, "transport")
         _transport = (_transport_raw or str(extra.get("transport", "auto") or "auto")).strip().lower()
@@ -816,7 +822,8 @@ class BuzzAdapter(BasePlatformAdapter):
         # Anchor: metadata.thread_id, then metadata.reply_to_message_id (stream/progress sends), then reply_to.
         meta = metadata or {}
         args = ["messages", "send", "--channel", str(chat_id), "--content", "-"]
-        args += self._reply_args(meta.get("thread_id") or meta.get("reply_to_message_id") or reply_to)
+        if str(chat_id) not in self._single_session_channels:
+            args += self._reply_args(meta.get("thread_id") or meta.get("reply_to_message_id") or reply_to)
         mention_pubkeys = await self._mention_pubkeys_for(chat_id, content)
         code, out, err = await self._run_message_send(args, content, mention_pubkeys)
         result = self._send_result(chat_id, code, out, err)
@@ -915,7 +922,8 @@ class BuzzAdapter(BasePlatformAdapter):
             # Never leak host filesystem paths into chat-visible errors.
             return SendResult(success=False, error="Media file not found")
         args = ["messages", "send", "--channel", str(chat_id), "--file", str(local), "--content", "-"]
-        args += self._reply_args((metadata or {}).get("thread_id") or reply_to)
+        if str(chat_id) not in self._single_session_channels:
+            args += self._reply_args((metadata or {}).get("thread_id") or reply_to)
         code, out, err = await self._run_message_send(args, caption or "")
         return self._send_result(chat_id, code, out, err, redact_path=local)
 
@@ -1526,6 +1534,8 @@ class BuzzAdapter(BasePlatformAdapter):
         # NIP-10 root scopes the session; remember it so our reply joins the SAME thread instead of nesting.
         thread_id = self._extract_thread_root(event)
         self._record_thread_root(event_id, event)
+        if channel_id in self._single_session_channels:
+            thread_id = None  # one conversation per channel; reply_to_* still carries the quoted message
         # Attachment fetch spends credentials: only the gateway's explicit ``True`` permits it (else fail closed).
         # The message still dispatches so GatewayRunner can apply denial/pairing.
         chat_type = "dm" if is_dm else "group"
@@ -1911,7 +1921,8 @@ async def _standalone_send(
         return send_error("Buzz standalone send: no target channel (set BUZZ_HOME_CHANNEL)")
     args = ["messages", "send", "--channel", target, "--content", "-"]
     # Same reply_to_mode / reply_in_thread gate as the live adapter.
-    if thread_id and _reply_to_mode(pconfig, extra) != "off":
+    single = {c.strip() for c in _split_csv(extra.get("single_session_channels", [])) if isinstance(c, str)}
+    if thread_id and _reply_to_mode(pconfig, extra) != "off" and target not in single:
         args += ["--reply-to", str(thread_id)]
     for media in media_files or []:
         args += ["--file", str(media[0] if isinstance(media, (list, tuple)) and media else media)]
