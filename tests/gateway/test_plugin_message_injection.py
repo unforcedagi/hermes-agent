@@ -291,6 +291,148 @@ async def test_dispatch_stops_when_gateway_drains_during_lookup():
     adapter.handle_message.assert_not_awaited()
 
 
+_ORIGIN = {"platform": "telegram", "chat_id": "42", "chat_type": "dm", "user_id": "42", "user_name": "tester"}
+
+
+@pytest.mark.asyncio
+async def test_origin_does_not_change_existing_session_dispatch():
+    """An existing routing entry still wins: strict replay of the stored origin, origin ignored."""
+    adapter = SimpleNamespace(handle_message=AsyncMock(), build_source=MagicMock())
+    entry = _entry()
+    runner = _runner(entry, adapter)
+
+    accepted = await runner._dispatch_plugin_message_injection(
+        session_key=entry.session_key, content="wake up", plugin_id="notify-plugin",
+        origin=dict(_ORIGIN, chat_id="999"),
+    )
+
+    assert accepted is True
+    adapter.build_source.assert_not_called()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source == entry.origin
+    assert event.metadata["gateway_session_strict"] is True
+    assert event.metadata["gateway_session_id"] == entry.session_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session_key", [None, "agent:main:telegram:dm:42"])
+async def test_origin_starts_new_session_through_adapter_build_source(session_key):
+    adapter = _RoutingAdapter()
+    adapter.handle_message = AsyncMock()
+    runner = _runner(None, adapter)
+
+    accepted = await runner._dispatch_plugin_message_injection(
+        session_key=session_key, content="first turn", plugin_id="notify-plugin", origin=dict(_ORIGIN),
+    )
+
+    assert accepted is True
+    if session_key is None:
+        runner._async_session_store.lookup_by_session_key.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "first turn"
+    assert event.internal is True
+    assert event.allow_gateway_control is False
+    assert event.source.platform == Platform.TELEGRAM
+    assert event.source.chat_id == "42"
+    assert event.source.user_id == "42"
+    # Built by the adapter itself: carries its transport provenance like a real inbound event.
+    assert event.source._transport_adapter_ref() is adapter
+    assert event.metadata == {
+        "hermes_plugin_id": "notify-plugin",
+        "hermes_plugin_injection": True,
+        "gateway_session_key": build_session_key(event.source),
+    }
+    assert "gateway_session_strict" not in event.metadata
+    runner._is_user_authorized.assert_called_once_with(event.source, allow_adapter_delegation=False)
+
+
+@pytest.mark.asyncio
+async def test_origin_new_session_reaches_runner_handler(tmp_path):
+    """End to end through the base adapter: the non-strict event is accepted and processed."""
+    adapter = _RoutingAdapter()
+    handler = AsyncMock(return_value=None)
+    adapter.set_message_handler(handler)
+    runner = _runner(None, adapter)
+
+    assert await runner._dispatch_plugin_message_injection(
+        session_key=None, content="hello", plugin_id="notify-plugin", origin=dict(_ORIGIN),
+    ) is True
+    for _ in range(20):
+        if handler.await_count:
+            break
+        await asyncio.sleep(0.01)
+    handler.assert_awaited()
+    assert handler.await_args.args[0].text == "hello"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raises", [False, True])
+async def test_origin_injection_blocked_by_authorization(raises):
+    adapter = _RoutingAdapter()
+    adapter.handle_message = AsyncMock()
+    runner = _runner(None, adapter)
+    if raises:
+        runner._is_user_authorized.side_effect = RuntimeError("config unavailable")
+    else:
+        runner._is_user_authorized.return_value = False
+
+    assert await runner._dispatch_plugin_message_injection(
+        session_key=None, content="wake", plugin_id="notify-plugin", origin=dict(_ORIGIN),
+    ) is False
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "origin",
+    [
+        dict(_ORIGIN),  # no adapter registered for telegram
+        dict(_ORIGIN, platform="not-a-real-platform"),
+        dict(_ORIGIN, profile="elsewhere"),  # a profile with no adapters never borrows the default bot
+    ],
+)
+async def test_origin_injection_without_live_adapter_returns_false(origin):
+    runner = _runner(None, None)
+    if origin.get("profile"):
+        adapter = _RoutingAdapter()
+        adapter.handle_message = AsyncMock()
+        runner.adapters = {Platform.TELEGRAM: adapter}
+
+    assert await runner._dispatch_plugin_message_injection(
+        session_key=None, content="wake", plugin_id="notify-plugin", origin=origin,
+    ) is False
+    runner._is_user_authorized.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_origin_injection_rejects_mismatched_session_key():
+    adapter = _RoutingAdapter()
+    adapter.handle_message = AsyncMock()
+    runner = _runner(None, adapter)
+
+    assert await runner._dispatch_plugin_message_injection(
+        session_key="agent:main:telegram:dm:other", content="wake", plugin_id="notify-plugin",
+        origin=dict(_ORIGIN),
+    ) is False
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_forwards_origin_only_when_given():
+    runner = _runner(None)
+    runner._gateway_loop = asyncio.get_running_loop()
+    runner._dispatch_plugin_message_injection = AsyncMock(return_value=True)
+
+    assert runner._schedule_plugin_message_injection(
+        session_key=None, content="wake", plugin_id="notify-plugin", origin=dict(_ORIGIN),
+    ) is True
+    await asyncio.sleep(0)
+    runner._dispatch_plugin_message_injection.assert_awaited_once_with(
+        session_key=None, content="wake", plugin_id="notify-plugin", origin=_ORIGIN,
+    )
+
+
 @pytest.mark.asyncio
 async def test_base_adapter_queues_non_control_plugin_text_for_exact_session():
     adapter = _RoutingAdapter()

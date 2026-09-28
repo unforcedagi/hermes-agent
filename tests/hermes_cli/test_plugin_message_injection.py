@@ -164,6 +164,41 @@ def test_gateway_injection_passes_host_owned_plugin_identity(tmp_path, monkeypat
     )
 
 
+def test_gateway_injection_accepts_origin_without_session_key(tmp_path, monkeypatch):
+    _write_plugin_config(tmp_path, monkeypatch, {"allow_gateway_injection": True})
+    context, manager = _context()
+    injector = MagicMock(return_value=True)
+    manager.set_gateway_message_injector(object(), injector)
+    origin = {"platform": "buzz", "chat_id": "c-1", "chat_type": "group", "user_id": "u"}
+
+    assert context.inject_message("wake up", origin=origin) is True
+    injector.assert_called_once_with(
+        session_key=None, content="wake up", plugin_id="notify-plugin", origin=origin,
+    )
+    assert injector.call_args.kwargs["origin"] is not origin  # plugin mutations can't race dispatch
+
+
+def test_gateway_injection_origin_still_requires_permission(tmp_path, monkeypatch):
+    _write_plugin_config(tmp_path, monkeypatch, {})
+    context, manager = _context()
+    injector = MagicMock(return_value=True)
+    manager.set_gateway_message_injector(object(), injector)
+
+    assert context.inject_message("wake", origin={"platform": "buzz", "chat_id": "c"}) is False
+    injector.assert_not_called()
+
+
+def test_gateway_injection_rejects_malformed_origin(tmp_path, monkeypatch):
+    _write_plugin_config(tmp_path, monkeypatch, {"allow_gateway_injection": True})
+    context, manager = _context()
+    injector = MagicMock(return_value=True)
+    manager.set_gateway_message_injector(object(), injector)
+
+    for bad in ({"chat_id": "c"}, {"platform": "buzz"}, "buzz:c"):
+        assert context.inject_message("wake", origin=bad) is False
+    injector.assert_not_called()
+
+
 def test_gateway_injection_returns_host_rejection(tmp_path, monkeypatch):
     _write_plugin_config(
         tmp_path,

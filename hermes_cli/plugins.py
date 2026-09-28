@@ -602,19 +602,30 @@ class PluginContext:
     # manager's home, never the active profile's (#65593 constraint).
     def inject_message(
         self, content: str, role: str = "user", *, session_key: str | None = None,
+        origin: dict | None = None,
     ) -> bool:
         """Inject a message into a CLI or gateway conversation (new turn if idle, interrupt if running).
-        Gateway injection needs an existing ``session_key`` plus
-        ``plugins.entries.<plugin_id>.allow_gateway_injection``; ``True`` means the gateway accepted the
-        request for async dispatch, not that delivery completed."""
+        Gateway injection needs ``plugins.entries.<plugin_id>.allow_gateway_injection`` plus either an
+        existing ``session_key`` or an ``origin`` — ``{"platform", "chat_id", "chat_type"?, "user_id"?,
+        "user_name"?, "chat_name"?, "thread_id"?, "profile"?}`` — describing the conversation as an inbound
+        event would. With ``origin`` the gateway builds the source through that platform's live adapter
+        and, when no session exists yet, the normal inbound path creates one (still authorized against
+        the gateway's current allowlist). An existing ``session_key`` always wins over ``origin``.
+        ``True`` means the gateway accepted the request for async dispatch, not that delivery completed."""
         cli = self._manager._cli_ref
         msg = content if role == "user" else f"[{role}] {content}"
         if cli is not None:
             queue_ = cli._interrupt_queue if getattr(cli, "_agent_running", False) else cli._pending_input
             queue_.put(msg)
             return True
-        if not session_key:
-            logger.warning("inject_message: gateway mode requires an existing session_key")
+        if origin is not None:
+            if (not isinstance(origin, dict) or not str(origin.get("platform") or "").strip()
+                    or not str(origin.get("chat_id") or "").strip()):
+                logger.warning("inject_message: origin must be a dict with platform and chat_id")
+                return False
+            origin = dict(origin)
+        if not session_key and origin is None:
+            logger.warning("inject_message: gateway mode requires a session_key or an origin")
             return False
         if not self._gateway_injection_allowed():
             logger.warning("inject_message: gateway injection denied for plugin %s; set "
@@ -624,10 +635,11 @@ class PluginContext:
         if not self._manager.has_gateway_message_injector:
             logger.warning("inject_message: no live gateway is available")
             return False
+        kwargs: dict[str, Any] = {"session_key": session_key or None, "content": msg, "plugin_id": self.plugin_id}
+        if origin is not None:
+            kwargs["origin"] = origin  # only when set: older injectors keep their three-keyword signature
         try:
-            return bool(self._manager.inject_gateway_message(
-                session_key=session_key, content=msg, plugin_id=self.plugin_id,
-            ))
+            return bool(self._manager.inject_gateway_message(**kwargs))
         except Exception:
             logger.warning("inject_message: gateway scheduling failed for plugin %s", self.plugin_id,
                            exc_info=True)

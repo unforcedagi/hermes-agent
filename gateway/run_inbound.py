@@ -1805,7 +1805,8 @@ class GatewayInboundMixin:
         get_plugin_manager().clear_gateway_message_injector(self)
 
     def _schedule_plugin_message_injection(
-        self, *, session_key: str, content: str, plugin_id: str
+        self, *, session_key: Optional[str], content: str, plugin_id: str,
+        origin: Optional[dict] = None,
     ) -> bool:
         """Schedule a plugin-triggered turn on the live gateway loop (thread-safe)."""
         from gateway.run import safe_schedule_threadsafe
@@ -1813,9 +1814,11 @@ class GatewayInboundMixin:
         if not getattr(self, "_running", False) or loop is None or loop.is_closed():
             return False
 
-        coro = self._dispatch_plugin_message_injection(
-            session_key=session_key, content=content, plugin_id=plugin_id,
-        )
+        dispatch_kwargs: Dict[str, Any] = {
+            "session_key": session_key, "content": content, "plugin_id": plugin_id}
+        if origin is not None:
+            dispatch_kwargs["origin"] = origin
+        coro = self._dispatch_plugin_message_injection(**dispatch_kwargs)
         try:
             current_loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -1855,15 +1858,27 @@ class GatewayInboundMixin:
         return True
 
     async def _dispatch_plugin_message_injection(
-        self, *, session_key: str, content: str, plugin_id: str
+        self, *, session_key: Optional[str], content: str, plugin_id: str,
+        origin: Optional[dict] = None,
     ) -> bool:
-        """Route a plugin-triggered turn through the session's live adapter."""
+        """Route a plugin-triggered turn through the session's live adapter.
+
+        An existing ``session_key`` replays its stored origin, pinned to that session id (strict).
+        Without one — or when the key has no routing entry yet — a plugin-supplied ``origin`` is built
+        into a source by the platform's live adapter (its own ``build_source``, so the key matches
+        a real inbound event exactly) and the normal inbound path finds or creates the session.
+        """
         def _accepting() -> bool:
             return getattr(self, "_running", False) and not getattr(self, "_draining", False)
 
         if not _accepting():
             return False
-        entry = await self.async_session_store.lookup_by_session_key(session_key)
+        entry = (await self.async_session_store.lookup_by_session_key(session_key)
+                 if session_key else None)
+        if (entry is None or entry.origin is None) and origin is not None:
+            return await self._dispatch_plugin_origin_injection(
+                session_key=session_key, content=content, plugin_id=plugin_id, origin=origin,
+                accepting=_accepting)
         if entry is None or entry.origin is None or not _accepting():
             return False
 
@@ -1901,6 +1916,74 @@ class GatewayInboundMixin:
             "Plugin message injection dispatched: plugin=%s session=%s session_id=%s",
             plugin_id, session_key, entry.session_id,
         )
+        return True
+
+    # Origin fields a plugin may name; forwarded verbatim to the adapter's own ``build_source``.
+    _PLUGIN_ORIGIN_SOURCE_FIELDS = ("chat_name", "chat_type", "user_id", "user_name", "thread_id")
+
+    async def _dispatch_plugin_origin_injection(
+        self, *, session_key: Optional[str], content: str, plugin_id: str, origin: dict, accepting,
+    ) -> bool:
+        """Start (or join) a session from a plugin-supplied origin: build the source through the
+        platform's live adapter, pin its identity at the same seam inbound events use, re-check the
+        gateway's current authorization, then hand it to the adapter's normal message path — which
+        creates the session because the event is not strict-pinned to an existing session id."""
+        def _reject(reason: str, *, exc_info: bool = False) -> bool:
+            logger.warning(
+                "Plugin origin injection %s: plugin=%s platform=%s chat=%s",
+                reason, plugin_id, origin.get("platform"), origin.get("chat_id"), exc_info=exc_info,
+            )
+            return False
+
+        try:
+            platform = Platform(str(origin.get("platform") or "").strip().lower())
+        except ValueError:
+            return _reject("names an unknown platform")
+        chat_id = str(origin.get("chat_id") or "").strip()
+        if not chat_id:
+            return _reject("has no chat_id")
+        profile = str(origin.get("profile") or "").strip() or None
+        adapter = self._adapters_for_profile(profile).get(platform)
+        if adapter is None or not callable(getattr(adapter, "build_source", None)):
+            return _reject("has no live adapter")
+
+        fields = {name: origin[name] for name in self._PLUGIN_ORIGIN_SOURCE_FIELDS if origin.get(name)}
+        try:
+            source = adapter.build_source(chat_id=chat_id, **fields)
+            # Identity FIRST, at the adapter seam a real inbound event uses (gateway/AGENTS.md).
+            canonicalize = getattr(adapter, "_canonicalize", None)
+            if callable(canonicalize):
+                canonicalize(source)
+            if getattr(source, "profile_route_rejected", False) is True:
+                return _reject("targets an unserved profile route")
+            derived_key = adapter._source_session_key(source)
+        except Exception:
+            return _reject("could not build a source", exc_info=True)
+        if session_key and derived_key != session_key:
+            logger.warning(
+                "Plugin origin injection key mismatch: plugin=%s expected=%s derived=%s",
+                plugin_id, session_key, derived_key,
+            )
+            return False
+
+        try:
+            authorized = self._is_user_authorized_for_source(source, allow_adapter_delegation=False)
+        except Exception:
+            return _reject("authorization check failed", exc_info=True)
+        if not authorized:
+            return _reject("denied by current gateway authorization")
+        if not accepting():
+            return False
+
+        await adapter.handle_message(MessageEvent(
+            text=content, message_type=MessageType.TEXT, source=source, internal=True,
+            allow_gateway_control=False,
+            metadata={
+                "hermes_plugin_id": plugin_id, "hermes_plugin_injection": True,
+                "gateway_session_key": derived_key,
+            },
+        ))
+        logger.info("Plugin origin injection dispatched: plugin=%s session=%s", plugin_id, derived_key)
         return True
 
     def _decide_image_input_mode(

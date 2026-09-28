@@ -792,7 +792,7 @@ ctx.inject_message(
 )
 ```
 
-**Signature:** `ctx.inject_message(content: str, role: str = "user", *, session_key: str | None = None) -> bool`
+**Signature:** `ctx.inject_message(content: str, role: str = "user", *, session_key: str | None = None, origin: dict | None = None) -> bool`
 
 In CLI mode:
 
@@ -803,15 +803,16 @@ In CLI mode:
 
 In gateway mode:
 
-- `session_key` is required and must identify an existing gateway session. It is the stable routing key, not the CLI session ID.
-- Hermes reuses that session's stored platform, chat, thread, profile, and conversation history. Plugins cannot supply a new chat route through this API.
+- Pass `session_key` (the stable routing key, not the CLI session ID), `origin`, or both.
+- When `session_key` names an existing gateway session, Hermes reuses that session's stored platform, chat, thread, profile, and conversation history, and `origin` is ignored.
+- To start a conversation that has no session yet, pass `origin={"platform": ..., "chat_id": ..., "chat_type"?: ..., "user_id"?: ..., "user_name"?: ..., "chat_name"?: ..., "thread_id"?: ..., "profile"?: ...}`. Hermes builds the source through that platform's live adapter (the same `build_source` a real inbound message uses), so the resulting key is exactly the one a real message from that user in that chat would get. The normal inbound path then creates the session. If you also pass `session_key`, it must equal the derived key, or the request is dropped. If there is no live adapter for the platform or profile, the request fails (it is logged, and the default profile's bot is never borrowed).
 - Hermes rechecks the stored route against the gateway's current authorisation rules before dispatch.
 - Routes that relied only on an adapter-time or upstream authorisation decision are rejected unless Hermes can revalidate them from current core allowlists, pairing, or explicit allow-all configuration.
 - Injected text is always conversational input. It cannot invoke slash commands, approve tools, or resolve pending confirmation and clarification prompts.
 - The route and conversation are pinned while dispatch is pending. Hermes drops the request if topic recovery changes the route or the session rotates before handling starts.
 - The request enters the platform adapter's normal message path. Active sessions use the existing busy-session queue rather than starting a competing turn.
 - Returns `True` when the live gateway accepts the request for asynchronous dispatch. This does not confirm that the agent turn or platform delivery has completed.
-- Returns `False` when `session_key` is omitted, the permission is not granted, or no live gateway can accept the request. Unknown or unroutable session keys discovered after asynchronous acceptance are written to the gateway log.
+- Returns `False` when both `session_key` and `origin` are omitted (or `origin` lacks `platform`/`chat_id`), the permission is not granted, or no live gateway can accept the request. Unknown or unroutable session keys discovered after asynchronous acceptance are written to the gateway log.
 
 This enables plugins like remote control viewers, messaging bridges, or webhook receivers to feed messages into the conversation from external sources.
 
@@ -825,7 +826,7 @@ plugins:
 ```
 
 :::warning
-Only grant gateway injection to plugins you trust. Hermes checks this host API permission and restricts it to existing session routes, but Python plugins run in-process and this setting is not a sandbox.
+Only grant gateway injection to plugins you trust. Hermes checks this host API permission and re-checks every route (stored or `origin`-built) against current gateway authorisation, but Python plugins run in-process and this setting is not a sandbox.
 :::
 
 :::note
