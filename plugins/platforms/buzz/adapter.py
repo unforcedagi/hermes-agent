@@ -1759,6 +1759,7 @@ class BuzzAdapter(BasePlatformAdapter):
 
     async def _localize_inbound_media(
         self, text: str, message_id: str, *, user_id: str = "", chat_type: Optional[str] = None, chat_id: Optional[str] = None,
+        skip_hashes: frozenset = frozenset(),
     ) -> Tuple[str, List[str], List[str], MessageType]:
         """Authenticate and cache same-relay media refs in *text* (failures skipped per object). Spends our
         credentials on a sender-chosen URL, so it runs only on the gateway's explicit ``True``."""
@@ -1778,6 +1779,8 @@ class BuzzAdapter(BasePlatformAdapter):
             path_match = _MEDIA_PATH_RE.fullmatch(urlsplit(url).path)
             if path_match is None:
                 continue
+            if path_match.group("sha").lower() in skip_hashes:
+                continue  # same blob already attached via imeta (the Uni app links its attachments in the text too)
             label = f"{path_match.group('sha')[:12]}{(path_match.group('ext') or '.bin').lower()}"
             try:
                 with tempfile.TemporaryDirectory(prefix="hermes-buzz-media-") as temp_dir:
@@ -1822,7 +1825,12 @@ class BuzzAdapter(BasePlatformAdapter):
         media_urls = list(media_urls or [])
         media_types = list(media_types or [])
         # Same-relay URL refs are localized in addition to the caller's imeta attachments (both explicit-True gated).
-        localized = await self._localize_inbound_media(text, message_id, user_id=user_id, chat_type=chat_type, chat_id=chat_id)
+        attached = frozenset(
+            str(m.get("sha256") or "").lower()
+            for m in (self._parse_imeta_attachments(raw_message)[0] if isinstance(raw_message, dict) else [])
+        )
+        localized = await self._localize_inbound_media(text, message_id, user_id=user_id, chat_type=chat_type, chat_id=chat_id,
+                                                       skip_hashes=attached)
         text, localized_urls, localized_types, localized_type = localized
         for path, mime in zip(localized_urls, localized_types):
             if path not in media_urls:

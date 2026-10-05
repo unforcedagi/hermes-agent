@@ -3907,3 +3907,40 @@ class TestChannelCursorPersistence:
         await adapter._poll_channel(CHANNEL)
 
         assert path.stat().st_mtime_ns == before
+
+
+@pytest.mark.asyncio
+async def test_text_link_to_attached_voice_note_is_not_localized_twice():
+    """The Uni app links its imeta attachment in the text too; a second (video-sniffed) copy made the
+    message a mixed DOCUMENT and skipped STT. The text link must not re-download an attached blob."""
+    from gateway.platforms.base import CachedMedia
+    sha = "b" * 64
+    adapter = _make_adapter()
+    adapter._user_names[OTHER_PUBKEY] = "Other"
+    adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+    adapter._cache_inbound_attachments = AsyncMock(return_value=[CachedMedia("/cache/v.webm", "audio/webm", "audio", "voice.webm")])
+    fetched = []
+
+    async def cli(args):
+        # Behave like a real `buzz media get`: write the blob to -o, so a duplicate fetch would really add media.
+        if args[:2] == ["media", "get"]:
+            fetched.append(args)
+            Path(args[args.index("-o") + 1]).write_bytes(b"\x1aE\xdf\xa3 webm bytes")
+        return 0, "", ""
+
+    adapter._run_cli = cli
+    events = []
+
+    async def capture(event):
+        events.append(event)
+
+    adapter.handle_message = capture
+    adapter._message_handler = object()
+    event = _event("voice-dup", content=f"@Chip hello\n[voice-20261005-161637.webm](https://test.relay/media/{sha}.webm)")
+    event["tags"].append(["imeta", f"url https://test.relay/media/{sha}.webm", "m audio/webm", f"x {sha}", "size 1",
+                          "filename voice-20261005-161637.webm"])
+    await adapter._handle_event(CHANNEL, adapter._channel_state[CHANNEL], event)
+    assert fetched == []
+    assert len(events) == 1
+    assert events[0].message_type is MessageType.VOICE
+    assert events[0].media_urls == ["/cache/v.webm"]
