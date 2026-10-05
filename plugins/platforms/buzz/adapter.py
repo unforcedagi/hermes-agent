@@ -500,6 +500,7 @@ def _p_tagged(event: dict, pubkey: str) -> bool:
 # Cap stored parent content snippets (gateway reply injection also clips).
 _EVENT_META_CONTENT_CAP = 500
 _MEDIA_KIND_PRIORITY = (("image", MessageType.PHOTO), ("audio", MessageType.AUDIO), ("video", MessageType.VIDEO))
+_VOICE_NOTE_NAME = re.compile(r"^voice-\d{8}-\d{6}\.(?:webm|m4a|ogg|wav|mp4|opus)$", re.IGNORECASE)
 _ATTACHMENT_KIND_TYPES = {"image": MessageType.PHOTO, "video": MessageType.VIDEO, "audio": MessageType.AUDIO, "document": MessageType.DOCUMENT}
 
 
@@ -1464,23 +1465,31 @@ class BuzzAdapter(BasePlatformAdapter):
                 httpx.AsyncClient(follow_redirects=False, timeout=timeout, headers={"Accept-Encoding": "identity"}) as client,
                 client.stream("GET", url) as response,
             ):
-                if response.status_code != 200:
+                if response.status_code in (401, 403):
+                    # Buzz media is auth-gated; fall back to the CLI, which signs the request with our key.
+                    data = None
+                elif response.status_code != 200:
                     logger.warning("Buzz: attachment download returned HTTP %s", response.status_code)
                     return None
-                if content_length := response.headers.get("content-length"):
-                    try:
-                        declared_response_size = int(content_length)
-                    except ValueError:
-                        return None
-                    if declared_response_size != metadata["size"]:
-                        logger.warning("Buzz: attachment Content-Length does not match imeta size")
-                        return None
-                data = bytearray()
-                async for chunk in response.aiter_bytes():
-                    data.extend(chunk)
-                    if len(data) > metadata["size"]:
-                        logger.warning("Buzz: attachment exceeded its declared size")
-                        return None
+                else:
+                    if content_length := response.headers.get("content-length"):
+                        try:
+                            declared_response_size = int(content_length)
+                        except ValueError:
+                            return None
+                        if declared_response_size != metadata["size"]:
+                            logger.warning("Buzz: attachment Content-Length does not match imeta size")
+                            return None
+                    data = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        data.extend(chunk)
+                        if len(data) > metadata["size"]:
+                            logger.warning("Buzz: attachment exceeded its declared size")
+                            return None
+            if data is None:
+                data = await self._download_attachment_via_cli(url, metadata)
+                if data is None:
+                    return None
         except (TimeoutError, httpx.HTTPError, OSError, ValueError) as exc:
             logger.warning("Buzz: attachment download failed: %s", exc)
             return None
@@ -1492,6 +1501,23 @@ class BuzzAdapter(BasePlatformAdapter):
             return await cache_media_bytes_async(bytes(data), filename=metadata["filename"], mime_type=metadata["mime_type"])
         except (OSError, ValueError) as exc:
             logger.warning("Buzz: attachment cache write failed: %s", exc)
+            return None
+
+    async def _download_attachment_via_cli(self, url: str, metadata: dict) -> Optional[bytes]:
+        """Authenticated fetch through ``buzz media get`` (signs with our key); size/SHA are re-checked by the caller."""
+        try:
+            with tempfile.TemporaryDirectory(prefix="hermes-buzz-media-") as temp_dir:
+                path = Path(temp_dir) / "attachment"
+                code, _out, _err = await self._run_cli(["media", "get", "-o", str(path), url])
+                if code != 0 or not path.is_file():
+                    logger.warning("Buzz: authenticated attachment download failed (exit %d)", code)
+                    return None
+                if path.stat().st_size > metadata["size"]:
+                    logger.warning("Buzz: attachment exceeded its declared size")
+                    return None
+                return await asyncio.to_thread(path.read_bytes)
+        except OSError as exc:
+            logger.warning("Buzz: authenticated attachment download failed: %s", exc)
             return None
 
     async def _cache_inbound_attachments(self, metadata_items: List[dict]) -> List[CachedMedia]:
@@ -1554,6 +1580,9 @@ class BuzzAdapter(BasePlatformAdapter):
             # Mixed kinds use document semantics so an audio member is not mistaken for a voice note (STT).
             kinds = {attachment.kind for attachment in attachments}
             message_type = _ATTACHMENT_KIND_TYPES.get(next(iter(kinds)), MessageType.DOCUMENT) if len(kinds) == 1 else MessageType.DOCUMENT
+            # A recorded voice note (Uni app names them voice-YYYYMMDD-HHMMSS.*) is speech: route it to STT.
+            if message_type == MessageType.AUDIO and all(_VOICE_NOTE_NAME.match(str(m.get("filename") or "")) for m in attachment_metadata):
+                message_type = MessageType.VOICE
         await self._dispatch_message(
             text=dispatch_text, chat_id=channel_id, chat_type=chat_type, user_id=pubkey,
             user_name=await self._resolve_user_name(pubkey), message_id=event_id,

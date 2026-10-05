@@ -802,6 +802,58 @@ class TestInboundAttachments:
         assert Path(cached.path).read_bytes() == payload
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("cli_bytes, ok", [(b"voice clip bytes", True), (b"tampered clip bytes", False)])
+    async def test_download_falls_back_to_signed_cli_on_401(self, monkeypatch, cli_bytes, ok):
+        import httpx
+
+        payload = b"voice clip bytes"
+        digest = hashlib.sha256(payload).hexdigest()
+        real_async_client = httpx.AsyncClient
+        monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: real_async_client(
+            transport=httpx.MockTransport(lambda request: httpx.Response(401)), **kwargs))
+        adapter = _make_adapter()
+        calls = []
+
+        async def cli(args):
+            calls.append(args)
+            Path(args[args.index("-o") + 1]).write_bytes(cli_bytes)
+            return 0, "", ""
+
+        adapter._run_cli = cli
+        cached = await adapter._download_attachment({
+            "url": "https://test.relay/media/clip.webm", "sha256": digest, "size": len(payload),
+            "filename": "voice-20261005-091011.webm", "mime_type": "audio/webm",
+        })
+
+        assert calls and calls[0][:2] == ["media", "get"] and calls[0][-1] == "https://test.relay/media/clip.webm"
+        assert (cached is not None) is ok
+        if ok:
+            assert Path(cached.path).read_bytes() == payload
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("filename, expected", [
+        ("voice-20261005-091011.webm", MessageType.VOICE),
+        ("interview.mp3", MessageType.AUDIO),
+    ])
+    async def test_recorded_voice_note_routes_to_stt(self, filename, expected):
+        adapter = _make_adapter()
+        adapter._user_names[OTHER_PUBKEY] = "Other"
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        adapter._cache_inbound_attachments = AsyncMock(return_value=[CachedMedia("/cache/clip", "audio/webm", "audio", filename)])
+        dispatched = []
+
+        async def capture(**kwargs):
+            dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        event = _event(f"voice-{filename}", content="@Chip")
+        event["tags"].append(["imeta", "url https://test.relay/media/clip", "m audio/webm", "x " + "a" * 64, "size 1", f"filename {filename}"])
+
+        await adapter._handle_event(CHANNEL, adapter._channel_state[CHANNEL], event)
+
+        assert dispatched[-1]["message_type"] is expected
+
+    @pytest.mark.asyncio
     async def test_download_rejects_untrusted_attachment_host_before_network(self, monkeypatch):
         import httpx
 
