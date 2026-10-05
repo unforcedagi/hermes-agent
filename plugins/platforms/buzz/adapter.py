@@ -15,6 +15,7 @@ import json
 import logging
 import mimetypes
 import os
+import dataclasses
 import re
 import shutil
 import tempfile
@@ -1497,7 +1498,11 @@ class BuzzAdapter(BasePlatformAdapter):
                 logger.warning("Buzz: attachment %s does not match imeta", what)
                 return None
         try:
-            return await cache_media_bytes_async(bytes(data), filename=metadata["filename"], mime_type=metadata["mime_type"])
+            cached = await cache_media_bytes_async(bytes(data), filename=metadata["filename"], mime_type=metadata["mime_type"])
+            # A WebM/MP4 container sniffs as video; the sender's imeta says audio (voice notes), so trust it for STT.
+            if cached is not None and cached.kind == "video" and str(metadata["mime_type"]).startswith("audio/"):
+                cached = dataclasses.replace(cached, kind="audio", media_type=metadata["mime_type"])
+            return cached
         except (OSError, ValueError) as exc:
             logger.warning("Buzz: attachment cache write failed: %s", exc)
             return None

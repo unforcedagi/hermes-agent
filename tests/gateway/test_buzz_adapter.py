@@ -802,11 +802,11 @@ class TestInboundAttachments:
         assert Path(cached.path).read_bytes() == payload
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("cli_bytes, ok", [(b"voice clip bytes", True), (b"tampered clip bytes", False)])
+    @pytest.mark.parametrize("cli_bytes, ok", [(b"\x1aE\xdf\xa3voice clip bytes", True), (b"tampered clip bytes", False)])
     async def test_download_falls_back_to_signed_cli_on_401(self, monkeypatch, cli_bytes, ok):
         import httpx
 
-        payload = b"voice clip bytes"
+        payload = b"\x1aE\xdf\xa3voice clip bytes"
         digest = hashlib.sha256(payload).hexdigest()
         real_async_client = httpx.AsyncClient
         monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: real_async_client(
@@ -829,6 +829,7 @@ class TestInboundAttachments:
         assert (cached is not None) is ok
         if ok:
             assert Path(cached.path).read_bytes() == payload
+            assert cached.kind == "audio" and cached.media_type == "audio/webm"  # webm sniffs as video
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("filename, expected", [
