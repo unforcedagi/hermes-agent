@@ -833,7 +833,7 @@ class TestInboundAttachments:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("filename, expected", [
         ("voice-20261005-091011.webm", MessageType.VOICE),
-        ("interview.mp3", MessageType.AUDIO),
+        ("interview.mp3", MessageType.VOICE),
     ])
     async def test_recorded_voice_note_routes_to_stt(self, filename, expected):
         adapter = _make_adapter()
@@ -1539,7 +1539,7 @@ class TestInboundAttachments:
         [
             ("image", "image/png", MessageType.PHOTO),
             ("video", "video/mp4", MessageType.VIDEO),
-            ("audio", "audio/mpeg", MessageType.AUDIO),
+            ("audio", "audio/mpeg", MessageType.VOICE),
             ("document", "application/pdf", MessageType.DOCUMENT),
         ],
     )

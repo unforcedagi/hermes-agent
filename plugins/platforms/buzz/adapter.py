@@ -500,7 +500,6 @@ def _p_tagged(event: dict, pubkey: str) -> bool:
 # Cap stored parent content snippets (gateway reply injection also clips).
 _EVENT_META_CONTENT_CAP = 500
 _MEDIA_KIND_PRIORITY = (("image", MessageType.PHOTO), ("audio", MessageType.AUDIO), ("video", MessageType.VIDEO))
-_VOICE_NOTE_NAME = re.compile(r"^voice-\d{8}-\d{6}\.(?:webm|m4a|ogg|wav|mp4|opus)$", re.IGNORECASE)
 _ATTACHMENT_KIND_TYPES = {"image": MessageType.PHOTO, "video": MessageType.VIDEO, "audio": MessageType.AUDIO, "document": MessageType.DOCUMENT}
 
 
@@ -1580,8 +1579,9 @@ class BuzzAdapter(BasePlatformAdapter):
             # Mixed kinds use document semantics so an audio member is not mistaken for a voice note (STT).
             kinds = {attachment.kind for attachment in attachments}
             message_type = _ATTACHMENT_KIND_TYPES.get(next(iter(kinds)), MessageType.DOCUMENT) if len(kinds) == 1 else MessageType.DOCUMENT
-            # A recorded voice note (Uni app names them voice-YYYYMMDD-HHMMSS.*) is speech: route it to STT.
-            if message_type == MessageType.AUDIO and all(_VOICE_NOTE_NAME.match(str(m.get("filename") or "")) for m in attachment_metadata):
+            # Buzz audio is speech in practice (app voice notes, forwarded recordings): route it through the
+            # gateway's STT like Telegram voice notes, so the agent gets "[voice transcript]"-style text in every room.
+            if message_type == MessageType.AUDIO:
                 message_type = MessageType.VOICE
         await self._dispatch_message(
             text=dispatch_text, chat_id=channel_id, chat_type=chat_type, user_id=pubkey,
