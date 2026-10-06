@@ -2159,6 +2159,10 @@ class GatewayInboundMixin:
                 logger.error("Transcription error: %s", e)
                 enriched_parts.append(self._untranscribed_audio_note(path))
 
+        if successful_transcripts:
+            from gateway.voice_transcript import strip_duplicate_voice_caption
+            user_text = strip_duplicate_voice_caption(user_text, successful_transcripts)
+
         if enriched_parts:
             user_text = self._prepend_media_prefix("\n\n".join(enriched_parts), user_text)
         return user_text, successful_transcripts
