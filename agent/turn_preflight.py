@@ -371,7 +371,18 @@ def compress_after_tool_results(
         # proactive_prune_tokens is exceeded; commits only past
         # proactive_prune_min_reclaim_tokens so cache breaks stay episodic.
         _prune = getattr(_compressor, "prune_tool_results_only", None)
-        if callable(_prune):
+        # Native replay providers can opt into a byte-stable sent-history
+        # prefix. An opportunistic 48k prune rewrites previously cached rows
+        # even though full compression (e.g. 300k) is still far away. Defer
+        # that rewrite, but retain the prune as an emergency escape hatch if
+        # compaction is blocked at/above its threshold. Other providers keep
+        # their existing policy; inspect the class so Mock truthiness cannot
+        # accidentally enable the capability.
+        _preserve_cache = (
+            getattr(type(getattr(agent, "client", None)), "HERMES_PRESERVE_CACHED_HISTORY", False) is True
+            and _real_tokens < int(getattr(_compressor, "threshold_tokens", 0) or 0)
+        )
+        if callable(_prune) and not _preserve_cache:
             try:
                 _pruned_msgs, _pruned_n = _prune(messages, current_tokens=_real_tokens)
             except Exception:
