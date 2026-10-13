@@ -4,6 +4,7 @@ When browser.backend is "browser-use", the model gets ``browser_exec`` tool
 instead of default browser tools
 """
 
+import ast
 import contextlib
 import importlib
 import json
@@ -44,12 +45,34 @@ try:
     def capture_screenshot(*_a, **_k):
         try:
             cdp("Page.bringToFront")
-        except Exception:
-            pass
+        except Exception as _e:
+            import sys as _sys
+            print("hermes: Page.bringToFront failed before capture_screenshot: %r" % (_e,), file=_sys.stderr)
         return _hermes_capture_screenshot(*_a, **_k)
 except NameError:
     pass
 """
+
+def _prepend_preamble(preamble: str, code: str) -> str:
+    """Prepend ``preamble`` to ``code``, keeping any ``from __future__`` imports first (they must lead the module)."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return preamble + code
+    lines = code.split("\n")
+    hoisted = []
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+            hoisted.append("\n".join(lines[node.lineno - 1:node.end_lineno]))
+            for i in range(node.lineno - 1, node.end_lineno):
+                lines[i] = ""
+        elif not (isinstance(node, ast.Expr) and isinstance(getattr(node, "value", None), ast.Constant)
+                  and isinstance(node.value.value, str)):
+            break
+    if not hoisted:
+        return preamble + code
+    return "\n".join(hoisted) + "\n" + preamble + "\n".join(lines)
+
 
 _OWN_TAB_PREAMBLE = """\
 # hermes: pin this named session to its own tab (once per daemon process)
@@ -651,9 +674,9 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     # _OWN_TAB_PREAMBLE). Private per-name browsers skip this — nothing to collide with.
     private_browser = env.pop(_PRIVATE_BROWSER_SENTINEL, None)  # always pop: never exported to the CLI
     if session and not private_browser:
-        code = _OWN_TAB_PREAMBLE + code
+        code = _prepend_preamble(_OWN_TAB_PREAMBLE, code)
     if "capture_screenshot" in code:
-        code = _SCREENSHOT_FRONT_PREAMBLE + code
+        code = _prepend_preamble(_SCREENSHOT_FRONT_PREAMBLE, code)
 
     workspace = _workspace_dir(task_id)
     if workspace:

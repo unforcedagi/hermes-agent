@@ -1540,3 +1540,33 @@ class TestScreenshotFrontPreamble:
         ns = {"cdp": boom, "capture_screenshot": lambda: "ok"}
         exec(bu_cli._SCREENSHOT_FRONT_PREAMBLE, ns)
         assert ns["capture_screenshot"]() == "ok"
+
+    def test_future_import_hoisted_above_preamble(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("tools.browser_use_cli._get_cdp_override", lambda: "", raising=False)
+        monkeypatch.setattr("tools.browser_tool_cdp._get_cdp_override", lambda: "")
+        monkeypatch.setattr(bt_cloud, "_get_cloud_provider", lambda: None)
+        cli = _fake_cli(tmp_path, "cat\n")
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        src = "from __future__ import annotations\nprint(capture_screenshot())"
+        out = json.loads(bu_cli.browser_exec(src))["output"]
+        compile(out, "<exec>", "exec")  # SyntaxError if __future__ is not first
+        assert out.startswith("from __future__ import annotations")
+        assert "Page.bringToFront" in out
+
+    def test_future_import_hoisted_with_named_session(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("tools.browser_tool_cdp._get_cdp_override", lambda: "")
+        monkeypatch.setattr(bt_cloud, "_get_cloud_provider", lambda: None)
+        cli = _fake_cli(tmp_path, "cat\n")
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        src = "from __future__ import annotations\nprint(capture_screenshot())"
+        out = json.loads(bu_cli.browser_exec(src, session="r7k2"))["output"]
+        compile(out, "<exec>", "exec")
+
+    def test_bring_to_front_failure_warns_on_stderr(self, capsys):
+        def boom(m, **k):
+            raise RuntimeError("no target")
+        ns = {"cdp": boom, "capture_screenshot": lambda: "ok"}
+        exec(bu_cli._SCREENSHOT_FRONT_PREAMBLE, ns)
+        assert ns["capture_screenshot"]() == "ok"
+        err = capsys.readouterr().err
+        assert "bringToFront" in err and "no target" in err
