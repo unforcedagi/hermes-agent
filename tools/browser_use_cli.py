@@ -36,6 +36,21 @@ _PRIVATE_BROWSER_SENTINEL = "_HERMES_BU_PRIVATE_BROWSER"
 # harness daemon attaches to the first existing page at startup, so two fresh named daemons can land on the
 # SAME tab. Steering each onto a tab it created prevents clobbering. Runs once per daemon (marker keyed by
 # BU_NAME + daemon pid).
+# A background tab never paints, so Page.captureScreenshot blocks until the call times out
+# (reproduced on uni-1, T-132). Bring the tab to the front first; best-effort.
+_SCREENSHOT_FRONT_PREAMBLE = """\
+try:
+    _hermes_capture_screenshot = capture_screenshot
+    def capture_screenshot(*_a, **_k):
+        try:
+            cdp("Page.bringToFront")
+        except Exception:
+            pass
+        return _hermes_capture_screenshot(*_a, **_k)
+except NameError:
+    pass
+"""
+
 _OWN_TAB_PREAMBLE = """\
 # hermes: pin this named session to its own tab (once per daemon process)
 def _hermes_ensure_own_tab():
@@ -637,6 +652,8 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     private_browser = env.pop(_PRIVATE_BROWSER_SENTINEL, None)  # always pop: never exported to the CLI
     if session and not private_browser:
         code = _OWN_TAB_PREAMBLE + code
+    if "capture_screenshot" in code:
+        code = _SCREENSHOT_FRONT_PREAMBLE + code
 
     workspace = _workspace_dir(task_id)
     if workspace:

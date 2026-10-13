@@ -1420,6 +1420,9 @@ DEFAULT_CONFIG = {
     # and resolved; read-only — creation goes to ~/.hermes/skills/ unless create_dir redirects it.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        # "strict" (default): the ## Skills block tells the model to err on the side of loading.
+        # "light": load only skills that carry knowledge the model lacks (agent/prompt_builder.py).
+        "load_guidance": "strict",
         # Where skill_manage-created skills go (empty = profile-local dir). When set, new skills
         # land here AND agent-facing instructions name this path; expanded (~, ${VAR}), relative to
         # HERMES_HOME, scanned alongside the local dir.

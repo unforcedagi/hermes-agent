@@ -1510,3 +1510,33 @@ class TestTimeoutProcessGroupKill:
         monkeypatch.setattr(bu_cli, "_kill_cli_process_group", lambda proc: None)
         with pytest.raises(subprocess.TimeoutExpired):
             bu_cli._run_cli_killing_process_group(["x"], "code", {}, 5)
+
+
+class TestScreenshotFrontPreamble:
+    """capture_screenshot is wrapped to Page.bringToFront first: a background tab never paints (T-132)."""
+
+    def test_screenshot_code_gets_wrapper_before_model_code(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("tools.browser_tool_cdp._get_cdp_override", lambda: "")
+        monkeypatch.setattr(bt_cloud, "_get_cloud_provider", lambda: None)
+        cli = _fake_cli(tmp_path, "cat\n")
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        out = json.loads(bu_cli.browser_exec("print(capture_screenshot())"))["output"]
+        assert 'cdp("Page.bringToFront")' in out
+        assert out.index("Page.bringToFront") < out.index("print(capture_screenshot())")
+        plain = json.loads(bu_cli.browser_exec("print('payload')"))["output"]
+        assert "Page.bringToFront" not in plain  # untouched when no screenshot is taken
+
+    def test_wrapper_executes_and_tolerates_missing_helpers(self):
+        calls = []
+        ns = {"cdp": lambda m, **k: calls.append(m), "capture_screenshot": lambda *a, **k: "shot.png"}
+        exec(bu_cli._SCREENSHOT_FRONT_PREAMBLE, ns)
+        assert ns["capture_screenshot"]() == "shot.png"
+        assert calls == ["Page.bringToFront"]
+        exec(bu_cli._SCREENSHOT_FRONT_PREAMBLE, {})  # no helpers: must not raise
+
+    def test_bring_to_front_failure_still_captures(self):
+        def boom(m, **k):
+            raise RuntimeError("no target")
+        ns = {"cdp": boom, "capture_screenshot": lambda: "ok"}
+        exec(bu_cli._SCREENSHOT_FRONT_PREAMBLE, ns)
+        assert ns["capture_screenshot"]() == "ok"

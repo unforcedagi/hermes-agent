@@ -1340,6 +1340,20 @@ def _label_visible_entries(visible_entries: list[dict], skills_by_category: dict
         skills_by_category.setdefault(category, []).append((fm, desc))
 
 
+# Opt-in (`skills.load_guidance: light`): load a skill only when it carries knowledge the model lacks.
+# Measured on Uni (T-132): the strict wording pulled general process skills into 22% of turns.
+SKILLS_LOAD_GUIDANCE_LIGHT = (
+    "## Skills\n"
+    "Scan the skills below. Load one with skill_view(name) when it carries knowledge you lack for this task: "
+    "an API, a tool's commands, a project's conventions, or the user's stated preferences for this kind of work. "
+    "Don't load general process skills (testing, debugging, review methodology) for work you already know how "
+    "to do. For creative and design builds, load the one relevant design skill, then write the whole artifact "
+    "in as few steps as you can.\n"
+    "If a skill has issues, fix it with skill_manage(action='patch'). After difficult/iterative tasks, offer to "
+    "save what you learned as a skill.\n"
+)
+
+
 def _render_skills_index(
     skills_by_category: dict[str, list[tuple[str, str]]], category_descriptions: dict[str, str],
     compact_categories: "frozenset[str] | None", available_tools: "set[str] | None",
@@ -1374,6 +1388,12 @@ def _render_skills_index(
     if is_single_query_session():
         return (
             ONESHOT_SKILLS_LOAD_GUIDANCE
+            + "\n<available_skills>\n" + "\n".join(index_lines) + "\n</available_skills>"
+            + hidden_note
+        )
+    if str((_config_readonly("skills.load_guidance").get("skills") or {}).get("load_guidance") or "").lower() == "light":
+        return (
+            SKILLS_LOAD_GUIDANCE_LIGHT
             + "\n<available_skills>\n" + "\n".join(index_lines) + "\n</available_skills>"
             + hidden_note
         )
