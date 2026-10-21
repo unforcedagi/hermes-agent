@@ -192,7 +192,7 @@ class TestThreadRootAnchoring:
         cli = _CapturingCli()
         adapter._run_cli = cli
         await adapter.send_image(CHANNEL, str(img), caption="pic", reply_to="trigger-evt")
-        args, _ = cli.calls[0]
+        args, _ = next(call for call in cli.calls if call[0][:2] == ["messages", "send"])
         assert args[args.index("--reply-to") + 1] == ROOT_EVT
 
 

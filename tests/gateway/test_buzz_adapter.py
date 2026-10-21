@@ -104,6 +104,10 @@ class _ScriptedCli:
         self.responses = {}  # (group, cmd) -> list of (code, stdout, stderr)
         self.calls = []
 
+    @property
+    def sends(self):
+        return [call for call in self.calls if call[0][:2] == ["messages", "send"]]
+
     def script(self, group, cmd, payload, code=0, stderr=""):
         stdout = payload if isinstance(payload, str) else json.dumps(payload)
         self.responses.setdefault((group, cmd), []).append((code, stdout, stderr))
@@ -2351,7 +2355,7 @@ class TestBuzzAdapterSend:
         adapter._run_cli = cli
         result = await adapter.send_image(CHANNEL, str(img), caption="screenshot")
         assert result.success is True
-        args, _stdin = cli.calls[0]
+        args, _stdin = cli.sends[0]
         assert args[args.index("--file") + 1] == str(img)
 
     @pytest.mark.asyncio
@@ -2370,7 +2374,7 @@ class TestBuzzAdapterSend:
             metadata={"thread_id": "stable-root"},
         )
 
-        args, _stdin = cli.calls[0]
+        args, _stdin = cli.sends[0]
         assert args[args.index("--reply-to") + 1] == "stable-root"
 
     @pytest.mark.asyncio
@@ -2464,9 +2468,9 @@ class TestBuzzAdapterSend:
         )
 
         assert result.success is True
-        assert len(cli.calls) == 2
-        assert cli.calls[0][1] == "See @session:default/example."
-        assert cli.calls[1][1] == "See @\u200bsession:default/example."
+        assert len(cli.sends) == 2
+        assert cli.sends[0][1] == "See @session:default/example."
+        assert cli.sends[1][1] == "See @\u200bsession:default/example."
 
     @pytest.mark.asyncio
     async def test_send_image_file_existing_local_path_stays_native_upload_after_probe_flip(
@@ -2492,7 +2496,7 @@ class TestBuzzAdapterSend:
         result = await adapter.send_image_file(CHANNEL, str(img), caption="screenshot")
 
         assert result.success is True
-        args, stdin_text = cli.calls[0]
+        args, stdin_text = cli.sends[0]
         assert args[:2] == ["messages", "send"]
         assert args[args.index("--channel") + 1] == CHANNEL
         assert args[args.index("--file") + 1] == str(img)
@@ -2517,7 +2521,7 @@ class TestBuzzAdapterSend:
         )
 
         assert result.success is True
-        args, stdin_text = cli.calls[0]
+        args, stdin_text = cli.sends[0]
         assert args[:2] == ["messages", "send"]
         assert args[args.index("--channel") + 1] == CHANNEL
         assert args[args.index("--file") + 1] == str(img)
@@ -2570,8 +2574,8 @@ class TestBuzzAdapterSend:
 
         await adapter.send_multiple_images(CHANNEL, [(img.as_uri(), "screenshot")])
 
-        assert len(cli.calls) == 1
-        args, stdin_text = cli.calls[0]
+        assert len(cli.sends) == 1
+        args, stdin_text = cli.sends[0]
         assert args[:2] == ["messages", "send"]
         assert args[args.index("--channel") + 1] == CHANNEL
         assert args[args.index("--file") + 1] == str(img)
@@ -3093,7 +3097,7 @@ class TestInboundMediaAuthorizationGate:
 
         assert result.success is True
         assert result.message_id == "evt-media"
-        args, stdin_text = cli.calls[0]
+        args, stdin_text = next(call for call in cli.calls if call[0][:2] == ["messages", "send"])
         assert args[args.index("--file") + 1] == str(media)
         # Threading contract (#99429): stable thread root beats latest-child.
         assert args[args.index("--reply-to") + 1] == "stable-root"

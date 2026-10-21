@@ -9,6 +9,7 @@ BUZZ_PRIVATE_KEY (nsec or hex): it reaches the CLI via the subprocess env and is
 """
 
 import asyncio
+from plugins.platforms.buzz.media_canon import canonicalize, SUPPORTED, VIDEO
 import contextlib
 import hashlib
 import json
@@ -511,6 +512,7 @@ class BuzzAdapter(BasePlatformAdapter):
         super().__init__(config=config, platform=Platform("buzz"))
         extra = getattr(config, "extra", {}) or {}
         self._extra = extra
+        self._media_upload_errors = OrderedDict()
         # Env overrides config.yaml, except under a secondary profile scope where extra wins (_scoped_platform_setting).
         self.relay_url = _configured_relay(extra)
         hosts = _split_csv(extra.get("attachment_hosts", []))
@@ -925,12 +927,56 @@ class BuzzAdapter(BasePlatformAdapter):
         local = Path(file_path).expanduser()
         if probe and not local.is_file():
             # Never leak host filesystem paths into chat-visible errors.
+            self._media_upload_errors[(str(chat_id), str(local.resolve()))] = "media file not found"
             return SendResult(success=False, error="Media file not found")
-        args = ["messages", "send", "--channel", str(chat_id), "--file", str(local), "--content", "-"]
-        if not self._is_single_session(chat_id):
-            args += self._reply_args((metadata or {}).get("thread_id") or reply_to)
-        code, out, err = await self._run_message_send(args, caption or "")
-        return self._send_result(chat_id, code, out, err, redact_path=local)
+        key = (str(chat_id), str(local.resolve()))
+        self._media_upload_errors.pop(key, None)
+        with tempfile.TemporaryDirectory(prefix="buzz-media-") as directory:
+            directory = Path(directory)
+            upload = local
+            if local.suffix.lower() in SUPPORTED:
+                # Authenticated lookup preserves the relay's existing hash dedupe, including
+                # files accepted under an older metadata policy. Verify bytes, not CLI status.
+                digest = await asyncio.to_thread(lambda: hashlib.sha256(local.read_bytes()).hexdigest())
+                cached = directory / "existing"
+                code, _, _ = await self._run_cli(["media", "get", "-o", str(cached), digest + local.suffix.lower()])
+                exists = code == 0 and cached.is_file() and await asyncio.to_thread(
+                    lambda: hashlib.sha256(cached.read_bytes()).hexdigest()) == digest
+                if not exists:
+                    upload = await asyncio.to_thread(canonicalize, local, directory)
+            for attempt in range(2):
+                args = ["messages", "send", "--channel", str(chat_id), "--file", str(upload), "--content", "-"]
+                if not self._is_single_session(chat_id):
+                    args += self._reply_args((metadata or {}).get("thread_id") or reply_to)
+                code, out, err = await self._run_message_send(args, caption or "")
+                result = self._send_result(chat_id, code, out, err, redact_path=upload)
+                if result.success:
+                    self._media_upload_errors.pop(key, None)
+                    return result
+                reason = self._media_failure_reason(err or result.error or "")
+                self._media_upload_errors[key] = reason
+                self._media_upload_errors.move_to_end(key)
+                while len(self._media_upload_errors) > 128:
+                    self._media_upload_errors.popitem(last=False)
+                if attempt or "422" not in (err or "") or "metadata" not in (err or "").lower():
+                    break
+                if local.suffix.lower() not in VIDEO | {".png"}:
+                    break
+                upload = await asyncio.to_thread(canonicalize, local, directory, heavy=True)
+            return result
+
+    @staticmethod
+    def _media_failure_reason(error: str) -> str:
+        # Allowlisted summaries deliberately discard arbitrary CLI diagnostics/host paths.
+        if "422" in error and "metadata" in error.lower():
+            return "relay refused it (422: media contains metadata)"
+        if "unsupported" in error.lower():
+            return "relay refused the file type"
+        if match := re.search(r"(?:relay error|HTTP) (\d{3})", error):
+            return f"relay refused it ({match[1]})"
+        if "not found" in error.lower():
+            return "media file not found"
+        return "upload failed; check the gateway log"
 
     async def send_image_file(
         self, chat_id: str, image_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
