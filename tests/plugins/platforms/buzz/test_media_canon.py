@@ -112,6 +112,21 @@ def test_retry_and_cleanup(video):
     assert video.is_file()
 
 
+def test_failure_reason_no_paths(video):
+    a = adapter()
+    a._run_cli = AsyncMock(return_value=(4, '', 'not found'))
+    a._run_message_send = AsyncMock(return_value=(4, '', f'upload failed for {video}: relay error 422: media contains metadata /host/private'))
+    a.emit_warning = AsyncMock()
+    async def check():
+        assert not (await a.send_video('test', str(video))).success
+        await a._notify_media_delivery_failure('test', str(video))
+    asyncio.run(check())
+    text = a.emit_warning.call_args.args[1]
+    assert '422: media contains metadata' in text and video.name in text
+    assert str(video.parent) not in text and '/host/' not in text
+    assert a._run_message_send.await_count == 2
+
+
 def test_existing_hash_unchanged(video):
     a = adapter()
     async def get(args):

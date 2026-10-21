@@ -978,6 +978,21 @@ class BuzzAdapter(BasePlatformAdapter):
             return "media file not found"
         return "upload failed; check the gateway log"
 
+    async def _notify_media_delivery_failure(
+        self, chat_id: str, media_path: str, *, is_voice: bool = False,
+        metadata: Optional[Dict[str, Any]] = None) -> None:
+        local = Path(media_path).expanduser()
+        reason = self._media_upload_errors.pop((str(chat_id), str(local.resolve())), "upload failed; check the gateway log")
+        kind = "audio" if is_voice else "video" if local.suffix.lower() in VIDEO else "file"
+        name = re.sub(r"[\x00-\x1f\x7f]", "", local.name)[:100]
+        text = f"⚠️ Couldn't deliver the {kind} attachment ({name}): {reason}."
+        if "metadata" in reason:
+            text += " Re-send with buzz messages send --file after stripping metadata."
+        try:
+            await self.emit_warning(chat_id, text, metadata=metadata)
+        except Exception:
+            logger.debug("Buzz: could not send media failure notice", exc_info=True)
+
     async def send_image_file(
         self, chat_id: str, image_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
