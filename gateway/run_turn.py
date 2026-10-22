@@ -2052,7 +2052,10 @@ class GatewayTurnMixin:
 
         # The context prompt render is pinned per session, keyed by a hash of the renderer inputs, so
         # the system prompt cannot drift turn-over-turn; a miss (thread rename, /sethome) re-renders.
-        context_prompt = self._pinned_session_context_prompt(context, _redact_pii, session_key)
+        # A self-injected turn borrows the display labels its synthesized source lacks (T-133).
+        context_prompt = self._pinned_session_context_prompt(
+            context, _redact_pii, session_key, internal=bool(getattr(event, "internal", False)),
+            origin=getattr(session_entry, "origin", None))
 
         # Per-turn notes ride the user message via the api_content sidecar, NOT context_prompt
         # (appending to the ephemeral system prompt forced a full agent rebuild).

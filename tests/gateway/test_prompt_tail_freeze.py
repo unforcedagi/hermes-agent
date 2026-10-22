@@ -28,6 +28,7 @@ from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.session import (
     SessionContext,
     SessionSource,
+    build_session_context,
     build_session_context_prompt,
 )
 
@@ -327,3 +328,137 @@ class TestConnectedPlatformsOrder:
         assert cfg_a.get_connected_platforms() == cfg_b.get_connected_platforms()
         values = [p.value for p in cfg_a.get_connected_platforms()]
         assert values == sorted(values)
+
+
+# ---------------------------------------------------------------------------
+# 7. Internal turns render the human turn's bytes (T-133)
+# ---------------------------------------------------------------------------
+# Driven through the real GatewayRunner._handle_message_with_agent -> _hmwa_prepare_turn, so the
+# run_turn.py call site is covered, not only the helper. The agent run itself is the boundary.
+
+_KEY = "agent:main:telegram:group:-1001:pk-owner"
+
+
+def _src(*, user_name=None, chat_name=None, chat_topic=None, user_id="pk-owner"):
+    """A group chat source. The bare call is the real uni-relay room-digest origin shape: platform,
+    chat_id, chat_type and user_id only."""
+    return SessionSource(platform=Platform.TELEGRAM, chat_id="-1001", chat_type="group", chat_name=chat_name,
+                         chat_topic=chat_topic, user_id=user_id, user_name=user_name)
+
+
+def _turn_runner(monkeypatch, tmp_path, *, origin=None, shared=False):
+    """A real GatewayRunner with the session store and the agent run faked (the
+    test_internal_notification_marker.py harness)."""
+    import sys
+    import types
+    from datetime import datetime
+    from unittest.mock import AsyncMock
+
+    import gateway.run as gateway_run
+    from gateway.session import SessionEntry
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    config = GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="t")})
+    config.group_sessions_per_user = not shared
+    runner = gateway_run.GatewayRunner(config)
+    runner.adapters = {}
+    runner._is_user_authorized = lambda _source: True
+    runner._set_session_env = lambda _context: None
+    runner._handle_active_session_busy_message = AsyncMock(return_value=False)
+    runner._session_db = MagicMock()
+    runner._recover_telegram_topic_thread_id = lambda _source: None
+    runner._cache_session_source = lambda _key, _source: None
+    runner._is_session_run_current = lambda _key, _gen: True
+    runner._begin_session_run_generation = lambda _key: 1
+    runner._reply_anchor_for_event = lambda _event: None
+    runner._get_guild_id = lambda _event: None
+    runner._should_send_voice_reply = lambda *_a, **_kw: False
+    runner.hooks = MagicMock()
+    runner.hooks.emit = AsyncMock()
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = SessionEntry(
+        session_key=_KEY, session_id="sess-t133", created_at=datetime.now(), updated_at=datetime.now(),
+        platform=Platform.TELEGRAM, chat_type="group", origin=origin)
+    runner.session_store.load_transcript.return_value = []
+    runner.session_store.has_platform_message_id.return_value = False
+    runner._run_agent = AsyncMock(return_value={
+        "final_response": "ok", "messages": [], "tools": [], "history_offset": 0, "last_prompt_tokens": 0})
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    monkeypatch.setattr("agent.model_metadata.get_model_context_length", lambda *_a, **_kw: 100_000)
+    return runner
+
+
+async def _turn(runner, source, *, internal):
+    """One gateway turn; returns the session-context prompt it handed to the agent run."""
+    from gateway.platforms.event import MessageEvent
+
+    event = MessageEvent(text="[digest] nothing new" if internal else "hello", source=source,
+                         message_id=None if internal else f"m-{runner._run_agent.call_count}", internal=internal)
+    try:
+        await runner._handle_message_with_agent(event, source, _KEY, 1)  # noqa: SLF001
+    finally:
+        runner._release_turn_lease(_KEY, 1)  # what _handle_message's finally does  # noqa: SLF001
+    return runner._run_agent.call_args.kwargs["context_prompt"]
+
+
+def _sig(runner, prompt, user_id):
+    return runner._agent_config_signature(  # noqa: SLF001
+        "opus", {"provider": "p", "base_url": "b", "api_mode": "chat_completions"}, ["t"], prompt, user_id=user_id)
+
+
+class TestInternalTurnPromptStability:
+    """A self-injected turn (plugin wake, room digest, process or delegation notice) is built from a
+    plugin origin or the creation-time session origin, whose display labels are missing or stale.
+    Rendered as is, it flipped the system prompt tail and the agent-cache signature on every
+    human <-> internal alternation: a fresh AIAgent and a full prompt-cache re-write (measured
+    2026-10-17..21: 38 of 92 warm turn-starts after a sender change missed, ~6M tokens written)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("human, internal, origin, between", [
+        (_src(user_name="pix", chat_name="main"), _src(), None, None),                              # room digest
+        (_src(user_name="pix", chat_name="main"), _src(chat_name="at-creation"), None, None),         # stale stored origin
+        (_src(user_name="pix", chat_name="main"), _src(chat_topic="cleared since"), None, None),      # human cleared it
+        (_src(user_name="pix", chat_name="main"), _src(), None, "evict"),                            # agent evicted between
+        (_src(user_name="pix", chat_name="main", user_id="pk-a"), _src(user_id="pk-creator"), None, "shared"),
+        (_src(user_name="pix", chat_name="main"), _src(), _src(user_name="pix", chat_name="main"), "internal-first"),
+    ], ids=["digest", "stale-origin", "cleared-label", "after-eviction", "shared-thread", "internal-first"])
+    async def test_internal_turn_renders_the_human_bytes(self, monkeypatch, tmp_path, human, internal, origin, between):
+        runner = _turn_runner(monkeypatch, tmp_path, origin=origin, shared=between == "shared")
+        if between == "internal-first":  # no human turn seen yet (e.g. after a restart): origin labels fill in
+            text = await _turn(runner, internal, internal=True)
+            first = await _turn(runner, human, internal=False)
+        else:
+            first = await _turn(runner, human, internal=False)
+            if between == "evict":
+                runner._evict_cached_agent(_KEY)  # noqa: SLF001
+            text = await _turn(runner, internal, internal=True)
+        assert _render(build_session_context(internal, runner.config)) != first  # the source really differs
+        assert _compose(text) == _compose(first)
+        if between != "shared":  # same user -> the cached agent is reused
+            assert _sig(runner, text, internal.user_id) == _sig(runner, first, human.user_id)
+        assert await _turn(runner, human, internal=False) == first
+
+    @pytest.mark.asyncio
+    async def test_internal_turn_never_hides_a_real_change(self, monkeypatch, tmp_path):
+        runner = _turn_runner(monkeypatch, tmp_path)
+        assert "-1001" in await _turn(runner, _src(user_name="pix"), internal=False)  # no chat_name: raw id shown
+        (tmp_path / "config.yaml").write_text("privacy:\n  redact_pii: true\n")
+        redacted = await _turn(runner, _src(), internal=True)
+        assert "-1001" not in redacted and "pk-owner" not in redacted and '"pix"' in redacted
+
+        runner = _turn_runner(monkeypatch, tmp_path / "home")
+        await _turn(runner, _src(user_name="pix", chat_name="main"), internal=False)
+        runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+            platform=Platform.TELEGRAM, chat_id="42", name="new-home")
+        moved = await _turn(runner, _src(), internal=True)
+        assert "new-home" in moved and '"pix"' in moved
+
+        # Another owner takes no labels, from the last human turn or from the origin.
+        runner = _turn_runner(monkeypatch, tmp_path / "other", origin=_src(user_name="pix", chat_name="main"))
+        await _turn(runner, _src(user_name="pix", chat_name="main"), internal=False)
+        other = _src(user_id="pk-bridge")
+        foreign = await _turn(runner, other, internal=True)
+        assert foreign == _render(build_session_context(other, runner.config)) and "pix" not in foreign

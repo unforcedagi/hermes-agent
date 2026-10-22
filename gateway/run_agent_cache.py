@@ -4,6 +4,7 @@ for GatewayRunner (MRO mixin). ``gateway.run`` internals are imported lazily ins
 
 from __future__ import annotations
 
+import dataclasses
 import importlib
 import logging
 import threading
@@ -615,9 +616,30 @@ class GatewayAgentCacheMixin:
             return None
         return f"[Voice channel now: {vc_now or 'not connected to a voice channel'}]"
 
-    def _pinned_session_context_prompt(self, context, redact_pii: bool, session_key: Optional[str]) -> str:
+    # Display labels an internal turn takes from the session's last human turn (T-133); never identity,
+    # routing or privacy inputs, which still key the render.
+    _HUMAN_LABELS = ("user_name", "chat_name", "chat_topic")
+
+    def _pinned_session_context_prompt(self, context, redact_pii: bool, session_key: Optional[str], *,
+                                       internal: bool = False, origin=None) -> str:
         """Session-context prompt pinned per session: key hit → pinned bytes reused VERBATIM (immune
-        to renderer nondeterminism); key miss → re-render and re-pin (rename, topic edit, /sethome)."""
+        to renderer nondeterminism); key miss → re-render and re-pin (rename, topic edit, /sethome).
+
+        An ``internal`` turn (plugin wake, room digest, process or delegation notice) arrives with a
+        source synthesized from a plugin origin or the creation-time session origin, whose display
+        labels are missing or stale. Rendered as is, it flipped this tail of the system prompt, and with
+        it the agent-cache signature, on every human <-> internal alternation: a fresh AIAgent and a full
+        prompt-cache re-write of the conversation (T-133). So an internal turn of the same owner renders
+        with the labels of the session's last human turn (kept across agent eviction, cleared with the
+        conversation); with none seen yet, its empty labels are filled from a same-owner ``origin``.
+        Every other input, redact_pii included, still keys the render."""
+        if internal:
+            _state = self._peek_session_state(session_key) if session_key else None
+            context = self._with_human_labels(context, _state.conversation.human_labels if _state else None, origin)
+        elif session_key:
+            self._session_state(session_key).conversation.human_labels = (
+                self._label_owner(context.source, context.shared_multi_user_session),
+                {name: getattr(context.source, name, None) for name in self._HUMAN_LABELS})
         _eph_key = self._ephemeral_change_key(context, redact_pii)
         _pin_state = self._peek_session_state(session_key) if session_key else None
         _eph_pin = _pin_state.conversation.ephemeral_pin if _pin_state else None
@@ -627,6 +649,33 @@ class GatewayAgentCacheMixin:
         if session_key:
             self._session_state(session_key).conversation.ephemeral_pin = (_eph_key, text)
         return text
+
+    @staticmethod
+    def _label_owner(source, shared: bool) -> tuple:
+        """Whose labels these are: the chat (and thread), plus the user unless the session is shared
+        (a shared session never renders the user, and its chat labels belong to every participant)."""
+        platform = getattr(source, "platform", None)
+        owner = (getattr(platform, "value", platform) or "", str(source.chat_id or ""), str(source.thread_id or ""))
+        return owner if shared else owner + (str(source.user_id or ""),)
+
+    @classmethod
+    def _with_human_labels(cls, context, human, origin):
+        """``context`` rendered with the last human turn's labels (same owner only), else with its
+        empty labels filled from a same-owner ``origin``. The copy is for the render alone."""
+        from gateway.session_identity import replace_source
+        source, shared = context.source, context.shared_multi_user_session
+        owner = cls._label_owner(source, shared)
+        if human is not None and human[0] == owner:
+            changes = human[1]
+        elif origin is not None and cls._label_owner(origin, shared) == owner:
+            changes = {name: getattr(origin, name, None) for name in cls._HUMAN_LABELS
+                       if not getattr(source, name, None) and getattr(origin, name, None)}
+        else:
+            changes = {}
+        changes = {name: value for name, value in changes.items() if getattr(source, name, None) != value}
+        if not changes:
+            return context
+        return dataclasses.replace(context, source=replace_source(source, **changes))
 
     @staticmethod
     def _ephemeral_change_key(context, redact_pii: bool) -> str:
