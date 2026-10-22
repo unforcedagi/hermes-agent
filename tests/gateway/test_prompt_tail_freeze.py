@@ -397,10 +397,12 @@ async def _turn(runner, source, *, internal):
 
     event = MessageEvent(text="[digest] nothing new" if internal else "hello", source=source,
                          message_id=None if internal else f"m-{runner._run_agent.call_count}", internal=internal)
+    calls = runner._run_agent.call_count
     try:
         await runner._handle_message_with_agent(event, source, _KEY, 1)  # noqa: SLF001
     finally:
         runner._release_turn_lease(_KEY, 1)  # what _handle_message's finally does  # noqa: SLF001
+    assert runner._run_agent.call_count == calls + 1, "the turn never reached the agent run"
     return runner._run_agent.call_args.kwargs["context_prompt"]
 
 
