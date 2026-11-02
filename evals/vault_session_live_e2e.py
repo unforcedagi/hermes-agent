@@ -27,6 +27,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -113,6 +114,23 @@ ACCOUNT: dict = {}  # the site's side of Uni's Kajabi-like account: email -> pas
 def _strong(pw: str) -> bool:  # Kajabi's rule: at least 10 characters, upper and lower case, a number, a symbol
     import re
     return len(pw) >= 10 and all(re.search(p, pw) for p in ("[a-z]", "[A-Z]", r"\d", r"[^A-Za-z0-9]"))
+
+
+def _encodings(secret: str) -> list[bytes]:
+    """The ways a value sits in a file: as is, form-urlencoded (a submitted form's POST body) and UTF-16 (Blink's
+    saved page state). A grep for the raw bytes alone misses a password with symbols in a POST body."""
+    from urllib.parse import quote_plus
+
+    return list(dict.fromkeys([secret.encode(), quote_plus(secret, safe="*").encode(), secret.encode("utf-16-le")]))
+
+
+def _files_holding(root: Path, secrets_: list[str]) -> list[str]:
+    needles = [e for s in secrets_ for e in _encodings(s)]
+    return [str(f.relative_to(root)) for f in root.rglob("*") if f.is_file() and not f.is_symlink()
+            and any(n in f.read_bytes() for n in needles)]
+
+
+BROWSER_PROFILE: list[Path] = []
 
 
 def _post(path: str, form: dict) -> bytes:
@@ -289,13 +307,18 @@ def _set_password_checks(origin: str, call, seen: list) -> list[str]:
     finally:
         plain.shutdown()
 
-    # Chromium's own profile (outside the temp home): session restore, form autofill, the password store.
+    # Chromium's own profile (outside the temp home). Chromium writes session state a few seconds after a change, so
+    # wait past that. Its session-restore file keeps what the SITE's form received (the POST body, the <pds-input>'s
+    # form value), as it would for a password a person typed; nothing else in the profile may hold it (saved
+    # passwords, autofill, history, cache, storage).
+    time.sleep(8)
     profile = Path(exec_seen("new_tab(); goto_url('chrome://version'); wait_for_load(); "
                              "print(js(\"document.getElementById('profile_path').textContent\"))"))
-    files = [f for f in profile.rglob("*") if f.is_file() and not f.is_symlink()] if profile.is_dir() else []
-    in_profile = [str(f.relative_to(profile)) for f in files if any(p.encode() in f.read_bytes() for p in generated)]
-    check("no generated password in the browser's profile files", generated and files and not in_profile,
-          ", ".join(in_profile[:5]) or f"{len(files)} files under {profile}")
+    BROWSER_PROFILE.append(profile)
+    holding = _files_holding(profile, generated) if profile.is_dir() else ["(no profile)"]
+    outside = [f for f in holding if not f.startswith("Sessions/")]
+    check("in the browser's profile only the session-restore file holds the submitted form, nothing else",
+          generated and not outside, f"holding: {', '.join(holding) or 'none'}")
     return generated
 
 
@@ -420,12 +443,14 @@ def main() -> int:
         _stop_harness_daemons(HOME / "bh")
 
     hermes_logging.flush_log_queue()
-    leaks = [str(f.relative_to(HOME)) for f in HOME.rglob("*") if f.is_file() and not f.is_symlink()
-             and any(pw.encode() in f.read_bytes() for pw in generated)]
-    check("no generated password in any file under the temp home (DEBUG logs, harness logs, vault)",
+    leaks = _files_holding(HOME, generated)
+    check("no generated password in any file under the temp home (DEBUG logs, harness logs, vault), in any encoding",
           generated and not leaks, ", ".join(leaks[:5]) or f"{sum(1 for f in HOME.rglob('*') if f.is_file())} files")
-    check("…nor in any tool result or browser_exec output", generated and not any(pw in out for pw in generated
-                                                                                   for out in seen + [n for _, _, n in results]))
+    texts = [t.encode() for t in seen + [n for _, _, n in results]]
+    check("…nor in any tool result or browser_exec output", generated and not any(
+        e in t for pw in generated for e in _encodings(pw) for t in texts))
+    check("the browser's profile is deleted when the browser closes", BROWSER_PROFILE
+          and not any(p.exists() for p in BROWSER_PROFILE), ", ".join(map(str, BROWSER_PROFILE)))
     failed = [n for n, ok, _ in results if not ok]
     print(f"\n{len(results) - len(failed)}/{len(results)} checks passed")
     return 1 if failed else 0
