@@ -109,6 +109,7 @@ def test_unlock_uses_vendor_passwordenv_contract_then_fill_routes_by_prefix(fake
     try:
         with patcher, patch("agent.vault_backends.enabled_backends", return_value=[backend]), \
              patch("tools.browser_vault_tool._page_origin", return_value=("https://example.com", None)), \
+             patch("tools.browser_vault_tool._browser_use_mode", return_value=False), \
              patch("tools.browser_vault_tool._eval_js", return_value={"success": True, "result": json.dumps([
                  {"tag": "input", "type": "password", "name": "password", "id": "pw", "autocomplete": "current-password",
                   "visible": True}])}), \

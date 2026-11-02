@@ -551,8 +551,7 @@ def _resolve_real_profile_cdp(env: dict, force_local: bool) -> Optional[str]:
 # (task, served profile) → {session name ("" = default): its ``local`` flag}, most recently driven last. The vault
 # tools act in the last one when the model names none, and reach a session's browser with the flag it was driven with.
 _exec_sessions: Dict[str, Dict[str, bool]] = {}
-_CURRENT_TAB_MARK = "HERMES_CURRENT_TAB "
-_CURRENT_TAB_CODE = f"import json\nprint({_CURRENT_TAB_MARK!r} + json.dumps(current_tab()))"
+_CURRENT_TAB_CODE = "import json\nprint(__MARK__ + json.dumps(current_tab()))"
 
 
 def _task_session_key(task_id: Optional[str]) -> str:
@@ -564,6 +563,11 @@ def last_exec_session(task_id: Optional[str]) -> Optional[str]:
     """The session the task's last browser_exec drove ("" = default), or None when it has driven none."""
     sessions = _exec_sessions.get(_task_session_key(task_id))
     return next(reversed(sessions)) if sessions else None
+
+
+def driven_sessions(task_id: Optional[str]) -> List[str]:
+    """The sessions (\"\" = default) the task's browser_exec has driven in this process."""
+    return list(_exec_sessions.get(_task_session_key(task_id)) or ())
 
 
 def _record_exec_session(task_id: Optional[str], session: str, local: bool) -> None:
@@ -578,16 +582,18 @@ def exec_current_tab(session: str, task_id: Optional[str]) -> Tuple[Optional[Dic
     Runs through browser_exec itself, so the same routing picks the same browser and the vault supervisor is
     (re)attached to it for ``task_id``."""
     local = (_exec_sessions.get(_task_session_key(task_id)) or {}).get(session, False)
-    ran = _run_exec(_CURRENT_TAB_CODE, session, 60, task_id, local)
+    mark = f"HERMES_CURRENT_TAB_{os.urandom(8).hex()} "  # per call: code in the workspace can't pre-print it
+    ran = _run_exec(_CURRENT_TAB_CODE.replace("__MARK__", repr(mark)), session, 60, task_id, local)
     if isinstance(ran, str):
         return None, ran[:300]
     # Raw stdout, never shown to the model: the model-facing output redacts registered vault values, which can
     # mangle a target id (a card's expiry month "7" is one of them).
     for line in (ran[0].stdout or "").splitlines():
-        if line.startswith(_CURRENT_TAB_MARK):
-            tab = json.loads(line[len(_CURRENT_TAB_MARK):])
-            if tab.get("targetId"):
-                return {"targetId": tab["targetId"], "url": str(tab.get("url") or "")}, None
+        if line.startswith(mark):
+            with contextlib.suppress(ValueError, AttributeError):
+                tab = json.loads(line[len(mark):])
+                if tab.get("targetId"):
+                    return {"targetId": str(tab["targetId"]), "url": str(tab.get("url") or "")}, None
     from agent.redact import redact_sensitive_text
     return None, redact_sensitive_text((ran[0].stderr or "").strip()[-300:], force=True) or "the browser session reported no current tab"
 

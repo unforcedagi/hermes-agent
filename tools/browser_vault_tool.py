@@ -27,11 +27,9 @@ autofill (kernel-login-autofill.ts / fill_from_vault.ts).
 from __future__ import annotations
 
 import json
-import math
 import re
 import secrets
 import logging
-from collections import Counter
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -104,7 +102,7 @@ def _ensure_supervisor(task_id: str):
     from tools.browser_supervisor import SUPERVISOR_REGISTRY
 
     supervisor = SUPERVISOR_REGISTRY.get(task_id)
-    if supervisor is not None:
+    if supervisor is not None or _browser_use_mode():  # agent-browser's browser is not browser_exec's
         return supervisor
     from tools.browser_tool import _last_session_key
     from tools.browser_tool_cdp import _get_dialog_policy_config, _resolve_cdp_override
@@ -209,12 +207,14 @@ def _pin_exec_tab(task_id: str, session: str) -> tuple[str, Optional[Dict[str, A
     session for messages, or ``("", refusal)``. The supervisor is keyed by task, and a browser_exec in another session
     re-points it, so every vault call pins again rather than trusting where it was left."""
     from tools.browser_supervisor import SUPERVISOR_REGISTRY
-    from tools.browser_use_cli import _SESSION_RE, exec_current_tab, last_exec_session
+    from tools.browser_use_cli import driven_sessions, exec_current_tab, last_exec_session
 
     name = session.strip() if session else (last_exec_session(task_id) or "")
-    if name and not _SESSION_RE.match(name):
-        return "", {"success": False, "error": f"Invalid session name {name!r}: use the name browser_exec was given."}
     where = f" in browser session {name!r}" if name else " in the default browser session"
+    if name not in driven_sessions(task_id):  # never start a browser (or move the default) on a vault call
+        return "", {"success": False, "error_type": "no_browser_session",
+                    "error": (f"No page is open{where} in this conversation. Open the login page with the browser "
+                              "first, in the session you pass here.")}
     tab, err = exec_current_tab(name, task_id)
     if tab is None:
         return "", {"success": False, "error_type": "no_browser_session",
@@ -276,8 +276,10 @@ def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[str]:
 # Identifiers that read like passwords
 # ---------------------------------------------------------------------------
 
-_EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
-_PHONE_RE = re.compile(r"\+?[\d\s().-]{7,20}")
+_EMAIL_RE = re.compile(r"[^@\s]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
+_PHONE_RE = re.compile(r"\+[\d\s().-]{7,20}|\(?\d[\d\s().-]{9,19}")
+# What a chosen username looks like: letters, then letters and . _ -, then at most two digits (aaron_g, john.smith2).
+_PLAIN_USERNAME_RE = re.compile(r"[A-Za-z][A-Za-z._-]{0,63}\d{0,2}")
 IDENTIFIER_HIDDEN = "(hidden: it looks like a password)"
 
 
@@ -285,25 +287,21 @@ def identifier_looks_like_password(identifier: str, password: str = "") -> bool:
     """True when what the user gave as a username reads like a password, so it must never be echoed to the model.
 
     A user who types their password into the username field (the 11-02 Buzz card mix-up) would otherwise see it
-    returned as agent-visible metadata. Emails and phone numbers pass; anything matching the password, carrying
-    characters usernames don't (spaces, !#$%&*…), mixing lower, upper and digits at password length, or long and
-    near-random is hidden.
-    Errs towards hiding: a hidden username costs the agent one question, a shown password costs the account."""
+    returned as agent-visible metadata. Shown: an email, a phone number, or a plain username (letters with . _ -
+    and at most two trailing digits, not mixing lower, upper and digits). Anything else, and anything that matches
+    the password, is hidden. Errs towards hiding: a hidden username costs the agent one question, a shown password
+    costs the account."""
     ident = (identifier or "").strip()
     if not ident:
         return False
     if password and (ident == password or (len(ident) >= 6 and (ident in password or password in ident))):
         return True
-    if _EMAIL_RE.fullmatch(ident) or _PHONE_RE.fullmatch(ident):
+    if _EMAIL_RE.fullmatch(ident) or (_PHONE_RE.fullmatch(ident) and sum(c.isdigit() for c in ident) >= 7):
         return False
-    if re.search(r"[^\w.@+-]", ident):
+    if not _PLAIN_USERNAME_RE.fullmatch(ident):
         return True
     classes = sum(bool(re.search(p, ident)) for p in (r"[a-z]", r"[A-Z]", r"\d"))
-    if len(ident) >= 8 and classes == 3:
-        return True
-    # Long, mixed and near-random (k3j9x0q2m8w1): generated passwords look like this, chosen usernames rarely do.
-    bits_per_char = -sum(n / len(ident) * math.log2(n / len(ident)) for n in Counter(ident).values())
-    return len(ident) >= 12 and classes >= 2 and bits_per_char >= 3.5
+    return len(ident) >= 8 and classes == 3
 
 
 # ---------------------------------------------------------------------------
@@ -408,12 +406,14 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None, ses
         return json.dumps({"success": False, "error_type": "save_declined",
                            "error": "The user chose not to save a login for this site. Do not ask again this turn."})
     identifier = str(answer["identifier"]).strip()
-    if identifier == str(answer["password"]).strip():
+    # The same value twice, or an email in the password field: the answers went into the wrong fields.
+    if identifier == str(answer["password"]).strip() or _EMAIL_RE.fullmatch(str(answer["password"]).strip()):
         answer.clear()
         return json.dumps({"success": False, "error_type": "identifier_is_password",
-                           "error": ("The username and the password the user entered are the same, so the password "
-                                     "most likely went into the username field. Nothing was saved. Ask them to save it "
-                                     "again with their username or email in the first field; never ask for either in chat.")})
+                           "error": ("The username and password the user entered look mixed up (the same value twice, "
+                                     "or an email in the password field). Nothing was saved. Ask them to save it again "
+                                     "with their username or email in the first field and the password in the second; "
+                                     "never ask for either in chat.")})
     masked = identifier_looks_like_password(identifier, str(answer["password"]))
     id_type = "email" if "@" in identifier else ("phone" if identifier.lstrip("+").isdigit() else "username")
     try:
@@ -428,6 +428,7 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None, ses
            "identifier_type": id_type, "fill": filled,
            "next": "Type the identifier into the username field if the form has one, then submit."}
     if masked:
+        del out["identifier_type"]  # even "email" says something about a hidden value
         out.update(identifier=IDENTIFIER_HIDDEN, identifier_masked=True, next=(
             "The username the user entered looks like a password, so it is hidden from you. Do not type it or ask "
             "for it in chat. Tell the user the saved username may be their password by mistake; they can delete "
@@ -455,6 +456,16 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, se
     if refusal:
         return json.dumps(refusal)
     site = origin.split("://", 1)[-1]
+    backend = backend_for_handle(handle) if handle else None
+    try:
+        meta = backend.get_meta(handle) if backend is not None else None
+    except Exception:  # a locked manager: no code can be generated either, so the user is asked on their surface
+        meta = None
+    allowed = (list(meta.allowed_origins) or ([str(meta.origin)] if meta.origin else [])) if meta else []
+    if allowed and origin not in allowed:  # a login's code goes only to that login's own site
+        return json.dumps({"success": False, "error_type": "origin_mismatch",
+                           "error": (f"Refused: the page origin ({origin}) is not the site this login was saved for "
+                                     f"({', '.join(allowed)}). No code was generated or asked for.")})
 
     nonce = secrets.token_hex(8)
     inspect = _eval_js(effective_task_id, build_inspection_js(nonce))
@@ -469,7 +480,6 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, se
 
     code: Optional[str] = None
     source = "user"
-    backend = backend_for_handle(handle) if handle else None
     if backend is not None:
         try:
             code = backend.resolve_otp(handle)

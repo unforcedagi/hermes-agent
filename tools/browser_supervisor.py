@@ -125,6 +125,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         self._pending_calls: Dict[int, asyncio.Future] = {}
         self._ws: Optional[ClientConnection] = None
         self._page_session_id: Optional[str] = None
+        self._pinned: Optional[Tuple[str, str]] = None  # (target id, session id) from the last focus_target
         # Dialog auto-dismiss watchdog handles (per dialog id) + id generator.
         self._dialog_watchdogs: Dict[str, asyncio.TimerHandle] = {}
         self._dialog_seq = 0
@@ -317,9 +318,16 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             info = (await self._cdp("Target.getTargetInfo", {"targetId": target_id}, timeout=timeout))["result"]["targetInfo"]
             if info.get("type") != "page":
                 return _fail(f"target {target_id} is a {info.get('type')}, not a page")
+            with self._state_lock:
+                old = self._pinned
+                if old and old[0] == target_id and self._page_session_id == old[1]:
+                    return {"ok": True, "url": str(info.get("url") or "")}  # still on it: one session per pin
             sid = await self._attach_page(target_id, timeout=timeout)
             with self._state_lock:
-                self._page_session_id = sid
+                self._page_session_id, self._pinned = sid, (target_id, sid)
+            if old:  # every vault call pins: without this each one would leave a session (and its dialog bridge)
+                with contextlib.suppress(Exception):
+                    await self._cdp("Target.detachFromTarget", {"sessionId": old[1]}, timeout=timeout)
             return {"ok": True, "url": str(info.get("url") or "")}
 
         try:

@@ -992,6 +992,25 @@ class TestVaultActsOnTheBrowserExecTab:
         assert out["error_type"] == "origin_mismatch" and "https://evil.test" in out["error"]
         assert "s3cret-pw" not in json.dumps(out)
 
+    def test_a_session_this_conversation_never_drove_is_refused_without_starting_a_browser(self, store, browser_use):
+        from tools import browser_use_cli
+
+        asked = []
+        out = self._save(store, lambda origin, host: asked.append(origin), session="typo")
+        assert out["error_type"] == "no_browser_session" and "typo" in out["error"]
+        assert browser_use.asked_tabs == [] and asked == []
+        assert browser_use_cli.last_exec_session("t1") == ""  # the typo did not become the default
+
+    def test_enter_code_for_a_saved_login_refuses_another_origin(self, store, browser_use):
+        """A login's code (generated from its authenticator key, or asked for) only goes to the login's own site."""
+        from tools import browser_vault_tool
+
+        meta = _add_login(store, origin="https://app.kajabi.test")
+        browser_use.tabs[""] = ("D1", "https://evil.test/verify")
+        with patch("agent.vault_store.get_vault_store", return_value=store):
+            out = json.loads(browser_vault_tool.browser_vault_enter_code(handle=meta.id, task_id="t1"))
+        assert out["error_type"] == "origin_mismatch" and "https://evil.test" in out["error"]
+
     def test_session_is_in_the_schema_only_in_browser_use_mode(self, monkeypatch):
         from tools import browser_vault_tool
 
@@ -1008,18 +1027,28 @@ class TestVaultActsOnTheBrowserExecTab:
 class TestIdentifierThatLooksLikeAPassword:
     """T-335: the user typed their password into the username card on Buzz, and save_login echoed it to the agent."""
 
-    @pytest.mark.parametrize("identifier", ["Xk9#mP2$vL7q", "Hunter2Pass", "k3j9x0q2m8w1", "correct horse battery"])
+    @pytest.mark.parametrize("identifier", ["Xk9#mP2$vL7q", "Hunter2Pass", "k3j9x0q2m8w1", "correct horse battery",
+                                            "P@ssw0rd.1", "12345678", "summer2024", "password123", "dragon2000x"])
     def test_masked_in_the_save_result_and_in_list(self, store, monkeypatch, identifier):
         from tools import browser_vault_tool
 
         monkeypatch.setattr(browser_vault_tool, "_page_origin", lambda task_id, where="": ("https://acme.test", None))
         monkeypatch.setattr(browser_vault_tool, "browser_vault_fill", lambda *a, **k: json.dumps({"success": True}))
         out = TestVaultActsOnTheBrowserExecTab._save(store, lambda o, h: {"identifier": identifier, "password": "pw-Real-77"})
-        assert out["success"] is True and out["identifier_masked"] is True
+        assert out["success"] is True and out["identifier_masked"] is True and "identifier_type" not in out
         assert identifier not in json.dumps(out) and "looks like a password" in out["next"]
         with patch("agent.vault_store.get_vault_store", return_value=store):
             listed = browser_vault_tool.browser_vault_list()
         assert identifier not in listed and json.loads(listed)["items"][0]["identifier_masked"] is True
+
+    def test_swapped_fields_are_not_saved(self, store, monkeypatch):
+        """An email in the PASSWORD card means the two answers went into each other's fields."""
+        from tools import browser_vault_tool
+
+        monkeypatch.setattr(browser_vault_tool, "_page_origin", lambda task_id, where="": ("https://acme.test", None))
+        out = TestVaultActsOnTheBrowserExecTab._save(store, lambda o, h: {"identifier": "sunshine", "password": "me@acme.test"})
+        assert out["error_type"] == "identifier_is_password" and "sunshine" not in json.dumps(out)
+        assert store.list_items() == []
 
     def test_identifier_equal_to_the_password_is_not_saved(self, store, monkeypatch):
         from tools import browser_vault_tool
@@ -1029,7 +1058,8 @@ class TestIdentifierThatLooksLikeAPassword:
         assert out["error_type"] == "identifier_is_password" and "sunshine" not in json.dumps(out)
         assert store.list_items() == []
 
-    @pytest.mark.parametrize("identifier", ["uni-test@example.invalid", "aaron_g", "john.smith2", "+1 (555) 123-4567"])
+    @pytest.mark.parametrize("identifier", ["uni-test@example.invalid", "aaron_g", "john.smith2", "+1 (555) 123-4567",
+                                            "AaronGabriel", "uni-test-account", "5551234567"])
     def test_ordinary_usernames_come_back(self, store, monkeypatch, identifier):
         from tools import browser_vault_tool
 
