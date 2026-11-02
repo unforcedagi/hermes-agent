@@ -283,6 +283,11 @@ _PLAIN_USERNAME_RE = re.compile(r"[A-Za-z][A-Za-z._-]{0,63}\d{0,2}")
 IDENTIFIER_HIDDEN = "(hidden: it looks like a password)"
 
 
+def identifier_type(identifier: str) -> str:
+    """The vault's ``identifier_type`` for a username the agent or the user gave."""
+    return "email" if "@" in identifier else ("phone" if identifier.lstrip("+").isdigit() else "username")
+
+
 def identifier_looks_like_password(identifier: str, password: str = "") -> bool:
     """True when what the user gave as a username reads like a password, so it must never be echoed to the model.
 
@@ -415,7 +420,7 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None, ses
                                      "with their username or email in the first field and the password in the second; "
                                      "never ask for either in chat.")})
     masked = identifier_looks_like_password(identifier, str(answer["password"]))
-    id_type = "email" if "@" in identifier else ("phone" if identifier.lstrip("+").isdigit() else "username")
+    id_type = identifier_type(identifier)
     try:
         meta = get_vault_store().add_item("login", site, {"identifier_type": id_type, "identifier": identifier,
                                                         "password": str(answer["password"])}, origin=origin)
@@ -609,22 +614,21 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, session: str 
         return json.dumps({"success": False, "error": "Page input inspection returned no usable controls."})
 
     classify = classify_login_control if meta.kind == "login" else classify_checkout_control
-    classified: list[ClassifiedLoginControl] = []
-    for raw in raw_controls:
-        if not isinstance(raw, dict):
-            continue
-        result = classify(LoginControl.from_dict(raw))
-        if result is not None:
-            classified.append(result)
-    if not classified:
-        if meta.kind == "login" and classify_new_password_controls([LoginControl.from_dict(r) for r in raw_controls
-                                                                    if isinstance(r, dict)]):
+    controls = [LoginControl.from_dict(raw) for raw in raw_controls if isinstance(raw, dict)]
+    classified: list[ClassifiedLoginControl] = [c for c in map(classify, controls) if c is not None]
+    if meta.kind == "login":
+        # A saved password never goes into a box that asks for a NEW one (a sign-up "Password" + "Confirm" pair
+        # reads as current-password to the login classifier). One predicate decides, the one set_password uses.
+        new_boxes = {t.control.index for t in classify_new_password_controls(controls)}
+        classified = [c for c in classified if c.control.index not in new_boxes]
+        if new_boxes and not any(c.token == "current-password" for c in classified):
             return json.dumps({"success": False, "error_type": "new_password_page", "error": (
                 "This page asks for a NEW password (sign-up, invite or reset), and a saved password is never typed "
                 "into a new-password box. If the account is yours (your own email or username), call "
                 "browser_vault_save_login with set_password=true and identifier=<that username or email>: a strong "
                 "password is generated, filled and saved without anyone seeing it. If it is the user's account, they "
                 "choose the new password themselves.")})
+    if not classified:
         return json.dumps({"success": False, "error": f"No {meta.kind} form fields were found on the current page."})
 
     # ── Resolve secret and fill (secret never enters any logged string) ─────

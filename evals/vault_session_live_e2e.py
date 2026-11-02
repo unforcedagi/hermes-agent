@@ -259,6 +259,16 @@ def _set_password_checks(origin: str, call, seen: list) -> list[str]:
     check("set_password without an identifier is refused", out.get("error_type") == "identifier_required"
           and len(store.list_items()) == before, out.get("error_type") or "")
 
+    # As on 11-02 (vault_d00abad4df28): logins a person saved for this account exist, so set_password will not replace
+    # them; remove them with the real CLI, as the refusal says, and call again.
+    out = call("browser_vault_save_login", {"set_password": True, "identifier": IDENTIFIER, "session": "kajabi"})
+    by_person = [m.id for m in store.list_items() if m.origin == origin and m.identifier == IDENTIFIER]
+    check("set_password will not replace a login a person saved, and says how to remove it",
+          out.get("error_type") == "login_saved_by_person" and f"hermes vault rm {by_person[0]}" in (out.get("error") or ""),
+          out.get("error_type") or json.dumps(out)[:120])
+    for item in by_person:
+        subprocess.run([sys.executable, str(ROOT / "hermes"), "vault", "rm", item], cwd=ROOT, check=True,
+                       capture_output=True, env={**os.environ, "HERMES_HOME": str(HOME)})
     out = call("browser_vault_save_login", {"set_password": True, "identifier": IDENTIFIER, "session": "kajabi"})
     handle = out.get("handle") or ""
     meta = store.get_meta(handle) if handle else None

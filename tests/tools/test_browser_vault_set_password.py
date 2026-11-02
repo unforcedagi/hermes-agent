@@ -30,13 +30,14 @@ def _targets(controls):
 
 
 class TestWhichFieldsTakeTheNewPassword:
-    def test_kajabi_shadow_box_and_its_hidden_confirmation(self):
-        """The shadow-root input has no form (form association stops at the shadow boundary); the hidden
-        confirmation sits in the light-DOM form. Both take the password."""
+    @pytest.mark.parametrize("autocomplete", ["new-password", ""])
+    def test_kajabi_shadow_box_and_its_hidden_confirmation(self, autocomplete):
+        """The shadow-root input counts in its host's form (the inspection reports it so); the hidden confirmation sits
+        in the same light-DOM form. Both take the password, also when the box itself carries no new-password hint."""
         controls = [_c(0, "hidden", "_method", form=0, hidden=True),
                     _c(1, "hidden", "user[reset_password_token] user_reset_password_token", form=0, hidden=True),
                     _c(2, "hidden", "user[password_confirmation]", form=0, hidden=True),
-                    _c(3, "password", "user[password] user_password", autocomplete="new-password", form=None)]
+                    _c(3, "password", "user[password] user_password", autocomplete=autocomplete, form=0)]
         assert _targets(controls) == [(2, "new-password-sync"), (3, "new-password")]
 
     def test_sign_up_form_with_a_plain_password_and_a_confirm_box(self):
@@ -59,6 +60,16 @@ class TestWhichFieldsTakeTheNewPassword:
     def test_a_sign_in_page_has_no_target(self, controls):
         assert _targets(controls) == []
 
+    @pytest.mark.parametrize("label", ["Verify your password", "Confirm password", "Re-enter password"])
+    def test_a_lone_confirm_style_box_is_a_re_authentication_prompt(self, label):
+        assert _targets([_c(0, "password", "pw", label)]) == []
+
+    def test_a_hidden_register_tab_does_not_turn_the_sign_in_box_into_a_target(self):
+        """No forms on the page (an SPA): the visible sign-in box and an unrendered Register panel's boxes."""
+        controls = [_c(0, "email", "email", form=None), _c(1, "password", "password", "Password", form=None),
+                    _c(2, "password", "confirm", "Confirm password", form=None, hidden=True)]
+        assert _targets(controls) == []
+
     def test_a_hidden_confirmation_alone_is_not_a_new_password_page(self):
         assert _targets([_c(0, "hidden", "user[password_confirmation]", hidden=True)]) == []
 
@@ -78,7 +89,7 @@ KAJABI = [  # what the inspection script reports for Kajabi's /password/edit (in
     {"index": 1, "type": "hidden", "name": "user[password_confirmation] ", "label": "", "autocomplete": "",
      "formIndex": 0, "hidden": True},
     {"index": 2, "type": "password", "name": "user[password] user_password", "label": "", "autocomplete": "new-password",
-     "formIndex": None},
+     "formIndex": 0},
 ]
 SIGN_IN = [
     {"index": 0, "type": "email", "name": "user[email]", "label": "", "autocomplete": "username", "formIndex": 0},
@@ -91,8 +102,8 @@ class _FakePage:
     """One tab as the supervisor sees it: answers the address read, the inspection and the fill. ``takes`` is how
     many targets end up holding the value (None = all of them)."""
 
-    def __init__(self, url, controls, takes=None, navigated=False):
-        self.url, self.controls, self.takes, self.navigated = url, controls, takes, navigated
+    def __init__(self, url, controls, takes=None, navigated=False, raises=False):
+        self.url, self.controls, self.takes, self.navigated, self.raises = url, controls, takes, navigated, raises
         self.written: list[dict] = []
 
     def focus_page(self, origin, accept=None):
@@ -106,6 +117,8 @@ class _FakePage:
         fills = json.loads(re.search(r"const fills = (\[.*?\]);\n", expression).group(1))
         if self.navigated:
             return {"ok": True, "result": json.dumps({"refused": "origin_changed", "found": "https://evil.test"})}
+        if self.raises:
+            raise ConnectionError(f"websocket closed while evaluating {expression[:4000]}")
         self.written = fills
         taken = len(fills) if self.takes is None else self.takes
         return {"ok": True, "result": json.dumps({"filled": taken, "matched": taken})}
@@ -173,28 +186,61 @@ def test_only_https_pages(store, page, url):
     assert page.written == [] and store.list_items() == []
 
 
-@pytest.mark.parametrize("failure", [{"takes": 1}, {"navigated": True}])
+@pytest.mark.parametrize("failure", [{"takes": 1}, {"navigated": True}, {"raises": True}])
 def test_the_vault_changes_only_when_the_page_took_the_password(store, page, failure):
-    """A new login is not left behind, and an existing one keeps its password, when the fill did not land."""
-    existing = store.add_item("login", "kajabi", {"identifier_type": "email", "identifier": "agi@unforced.test",
-                                                  "password": "the-old-one-77"}, origin="https://app.kajabi.test")
+    """A new login is not left behind, and an earlier generated one keeps its password, when the fill did not land;
+    an error from the browser comes back without the password."""
+    earlier = store.add_item("login", "kajabi", {"identifier_type": "email", "identifier": "agi@unforced.test",
+                                                 "password": "the-old-one-77"}, origin="https://app.kajabi.test",
+                             generated=True)
     other = store.add_item("login", "kajabi", {"identifier_type": "email", "identifier": "someone@else.test",
                                                "password": "theirs-88"}, origin="https://app.kajabi.test")
     for key, value in failure.items():
         setattr(page, key, value)
-    out = json.loads(_set_password(identifier="agi@unforced.test"))
-    assert out["success"] is False, out
-    assert store.resolve_secret(existing.id)["password"] == "the-old-one-77"
-    store.remove_item(existing.id)
-    out = json.loads(_set_password(identifier="agi@unforced.test"))
-    assert out["success"] is False and [m.id for m in store.list_items()] == [other.id]
+    raw = _set_password(identifier="agi@unforced.test")
+    assert json.loads(raw)["success"] is False, raw
+    assert store.resolve_secret(earlier.id)["password"] == "the-old-one-77"
+    store.remove_item(earlier.id)
+    raw = _set_password(identifier="agi@unforced.test")
+    assert json.loads(raw)["success"] is False and [m.id for m in store.list_items()] == [other.id]
     assert store.resolve_secret(other.id)["password"] == "theirs-88"
+    assert "const fills" not in raw and "data-hermes-vault-slot" not in raw  # no part of the fill script (it holds the value)
 
 
-def test_fill_on_a_new_password_page_says_what_to_do(store, page):
-    """The 11-02 dead end: fill answered "No login form fields were found" on Kajabi's reset page."""
+def test_a_login_a_person_saved_is_never_replaced(store, page):
+    """save_login / `hermes vault add` items hold a password a person typed and may still use."""
+    saved = store.add_item("login", "kajabi", {"identifier_type": "email", "identifier": "Agi@Unforced.test",
+                                               "password": "typed-by-aaron-1"}, origin="https://app.kajabi.test")
+    out = json.loads(_set_password(identifier="agi@unforced.test"))
+    assert out["error_type"] == "login_saved_by_person" and f"hermes vault rm {saved.id}" in out["error"], out
+    assert page.written == [] and store.resolve_secret(saved.id)["password"] == "typed-by-aaron-1"
+
+
+def test_the_password_fits_the_fields_maxlength(store, page):
+    page.controls = [dict(KAJABI[2], maxLength=16), KAJABI[1]]
+    out = json.loads(_set_password(identifier="agi@unforced.test"))
+    assert out["success"] is True, out
+    assert len(store.resolve_secret(out["handle"])["password"]) == 16
+    page.controls = [dict(KAJABI[2], maxLength=6), KAJABI[1]]
+    store.remove_item(out["handle"])
+    assert json.loads(_set_password(identifier="agi@unforced.test"))["error_type"] == "password_too_short"
+    assert store.list_items() == []
+
+
+SIGN_UP = [  # what the login classifier alone reads as an email + a current password
+    {"index": 0, "type": "email", "name": "email", "label": "Email", "autocomplete": "", "formIndex": 0},
+    {"index": 1, "type": "password", "name": "password", "label": "Password", "autocomplete": "", "formIndex": 0},
+    {"index": 2, "type": "password", "name": "password2", "label": "Confirm password", "autocomplete": "", "formIndex": 0},
+]
+
+
+@pytest.mark.parametrize("controls", [KAJABI, SIGN_UP], ids=["kajabi", "sign-up"])
+def test_fill_never_types_a_saved_password_into_a_new_password_box(store, page, controls):
+    """The 11-02 dead end (fill answered "No login form fields were found" on Kajabi's reset page), and a sign-up form
+    whose plain "Password" box the login classifier alone would have filled with the saved password."""
     from tools import browser_vault_tool
 
+    page.controls = controls
     meta = store.add_item("login", "kajabi", {"identifier_type": "email", "identifier": "agi@unforced.test",
                                               "password": "pw-77-x"}, origin="https://app.kajabi.test")
     out = json.loads(browser_vault_tool.browser_vault_fill(meta.id, task_id="t1"))

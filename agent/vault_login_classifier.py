@@ -181,46 +181,54 @@ def select_password_fill(
     ]
 
 
-_RE_NEW_PASSWORD = re.compile(r"\b(?:new|create|choose|set|confirm|repeat|retype|re\s*enter|verify)\s*(?:a\s*|your\s*)?"
-                              r"(?:new\s*)?password\b|\bpassword\s*(?:again|confirm|confirmation|repeat)\b")
-_RE_CONFIRM_PASSWORD = re.compile(r"\bpassword\s*(?:confirm|confirmation|again|repeat)\b|"
-                                  r"\b(?:confirm|repeat|retype|verify)\w*\s*(?:your\s*)?(?:new\s*)?password\b")
+# A box that asks for a password nobody has yet. "Confirm/verify/repeat password" alone is also what a re-authentication
+# prompt says, so those count only next to another password box (see classify_new_password_controls).
+_RE_NEW_PASSWORD = re.compile(r"\b(?:new|create|choose|set)\s*(?:a\s*|your\s*)?(?:new\s*)?password\b")
+_RE_CONFIRM_PASSWORD = re.compile(r"\bpassword\s*(?:again|confirm|confirmation|repeat)\b|"
+                                  r"\b(?:confirm|repeat|retype|re\s*enter|verify)\s*(?:your\s*)?(?:new\s*)?password\b")
 _RE_CURRENT_PASSWORD = re.compile(r"\b(?:current|old|existing|present)\s*password\b")
 
 
 def classify_new_password_controls(controls: List[LoginControl]) -> List[ClassifiedLoginControl]:
     """The fields a set-password page (sign-up, invite, reset) wants the NEW password in; ``[]`` on a sign-in page.
 
-    A password box is "new" when its autocomplete says ``new-password`` or its name/label says new/create/confirm/
-    repeat password; a plain password box joins them when its form also has such a box or a confirmation. A current
-    password box (``current-password``, "current/old password") is never a target, so a change-password page keeps
-    the current one for browser_vault_fill. ``token`` is ``new-password`` for visible boxes and ``new-password-sync``
-    for a confirmation the page keeps in an unrendered input (Kajabi's ``type=hidden user[password_confirmation]``,
-    which its <pds-input> is meant to sync). A form without a visible new box yields nothing: a sign-in page has no
-    target. Controls inside a shadow root have no form (form association stops at the shadow boundary), so a
-    form-less control groups with every form."""
+    Per form (a control inside a web component counts in its host's form): a password box is "new" when its
+    autocomplete says ``new-password`` or its name/label says new/create/choose password. A confirm-style box
+    (confirm/repeat/verify password, password confirmation) and a plain box join only when the form has a second
+    password box that makes it a set-password form: a new one, or a plain + confirm pair. A lone "Verify your password"
+    is a re-authentication prompt, not a target. A confirmation the page keeps in a ``type=hidden`` input (Kajabi's
+    ``user[password_confirmation]``, synced by its <pds-input>) marks its form's plain box as new too, and is filled
+    as ``new-password-sync``; an unrendered password box (a hidden Register tab) is filled with its form but never
+    makes it a set-password form. A current-password box (``current-password``, "current/old password") is never a
+    target, so a change-password page keeps it for browser_vault_fill."""
     def text(c: LoginControl) -> str:
         return _normalize_text(" ".join(p for p in (c.name, c.label) if p))
 
-    def same_group(a: LoginControl, b: LoginControl) -> bool:
-        return a.form_index is None or b.form_index is None or a.form_index == b.form_index
-
-    new, plain, sync = [], [], []
+    forms: Dict[Optional[int], Dict[str, List[LoginControl]]] = {}
     for c in controls:
         tokens = c.autocomplete.lower().split()
+        if c.type not in ("password", "hidden") or "one-time-code" in tokens or "current-password" in tokens:
+            continue
+        if _RE_CURRENT_PASSWORD.search(text(c)):
+            continue
+        kind = ("new" if "new-password" in tokens or _RE_NEW_PASSWORD.search(text(c))
+                else "confirm" if _RE_CONFIRM_PASSWORD.search(text(c)) else "plain")
         if c.hidden:
-            if c.type in ("hidden", "password") and _RE_CONFIRM_PASSWORD.search(text(c)):
-                sync.append(c)
+            kind = "sync" if kind == "confirm" or (kind == "new" and c.type == "hidden") else None
+        elif c.type != "password":
+            kind = None
+        if kind:
+            forms.setdefault(c.form_index, {}).setdefault(kind, []).append(c)
+    out: List[ClassifiedLoginControl] = []
+    for group in forms.values():
+        new, confirm, plain, sync = (group.get(k, []) for k in ("new", "confirm", "plain", "sync"))
+        is_set_form = bool(new) or (plain and confirm) or any(c.type == "hidden" for c in sync)
+        visible = new + confirm + plain if is_set_form else []
+        if not visible:
             continue
-        if c.type != "password" or "one-time-code" in tokens:
-            continue
-        if "current-password" in tokens or _RE_CURRENT_PASSWORD.search(text(c)):
-            continue
-        (new if "new-password" in tokens or _RE_NEW_PASSWORD.search(text(c)) else plain).append(c)
-    visible = new + [p for p in plain if any(same_group(p, o) for o in new + sync)]
-    hidden = [s for s in sync if any(same_group(s, v) for v in visible)]
-    return sorted([ClassifiedLoginControl(c, 100, "new-password") for c in visible], key=lambda t: t.control.index) + \
-        sorted([ClassifiedLoginControl(c, 100, "new-password-sync") for c in hidden], key=lambda t: t.control.index)
+        out += [ClassifiedLoginControl(c, 100, "new-password") for c in sorted(visible, key=lambda c: c.index)]
+        out += [ClassifiedLoginControl(c, 100, "new-password-sync") for c in sorted(sync, key=lambda c: c.index)]
+    return out
 
 
 def classify_checkout_control(control: LoginControl) -> Optional[ClassifiedLoginControl]:
@@ -333,7 +341,9 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
     // Inside a web component the host carries the label/name the page author wrote (<pds-input label="Password">).
     const host = root instanceof ShadowRoot ? root.host : null;
     const hostText = host ? ["label", "aria-label", "placeholder", "name"].map((a) => host.getAttribute(a) || "").join(" ") : "";
-    const resolvedFormIndex = element.form ? forms.indexOf(element.form) : -1;
+    // Form association stops at a shadow boundary: an input inside a web component counts in its host's form.
+    const form = element.form || (host && host.closest ? host.closest("form") : null);
+    const resolvedFormIndex = form ? forms.indexOf(form) : -1;
     return [{
       autocomplete: element.autocomplete || "",
       formIndex: resolvedFormIndex >= 0 ? resolvedFormIndex : null,

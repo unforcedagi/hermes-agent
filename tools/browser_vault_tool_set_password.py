@@ -17,6 +17,7 @@ from typing import Any, Dict, Optional
 # Symbols every site we met accepts (Kajabi wants one of "e.g. !?$"); no quotes, spaces or backslashes.
 _SYMBOLS = "!?$#%*-_+=."
 _PASSWORD_LENGTH = 24
+_MIN_LENGTH = 12
 
 
 def generate_password(length: int = _PASSWORD_LENGTH) -> str:
@@ -79,35 +80,48 @@ def browser_vault_set_password(identifier: str, label: str = "", task_id: Option
     store = get_vault_store()
     existing = next((m for m in store.list_items() if m.kind == "login" and m.origin == origin
                      and (m.identifier or "").casefold() == identifier.casefold()), None)
-    password = generate_password()
+    if existing is not None and not existing.generated:
+        # A person typed that password (save_login, `hermes vault add`) and may still use it: never replace it here.
+        return _refuse("login_saved_by_person", (
+            f"A login for {identifier} on {origin} was saved by a person ({existing.id}), so set_password will not "
+            "replace it. If this account is yours and that saved password is no longer wanted, remove it with "
+            f"`hermes vault rm {existing.id}` and call again. Nothing was generated or saved."))
+    limits = [t.control.max_length for t in targets if t.token == "new-password" and t.control.max_length]
+    length = min([_PASSWORD_LENGTH, *limits])
+    if length < _MIN_LENGTH:
+        return _refuse("password_too_short", (f"The new-password field{where} takes at most {length} characters, too "
+                                              "short for a generated password. Nothing was generated or saved."))
+    password = generate_password(length)
     register_vault_redaction_value(password)  # before it touches the page: no later browser result can echo it
     secret = {"password": password}
-    previous: Optional[str] = None
+    previous = ""
     try:
         if existing is not None:
             previous = str(store.resolve_secret(existing.id).get("password") or "")
             meta = store.set_password(existing.id, password)
         else:
-            id_type = "email" if "@" in identifier else ("phone" if identifier.lstrip("+").isdigit() else "username")
             meta = store.add_item("login", label.strip() or origin.split("://", 1)[-1],
-                                  {"identifier_type": id_type, "identifier": identifier, "password": password}, origin=origin)
+                                  {"identifier_type": bvt.identifier_type(identifier), "identifier": identifier,
+                                   "password": password}, origin=origin, generated=True)
     except Exception as exc:
         return _refuse("save_failed", scrub_secret_from_text(str(exc), secret)[:200])
 
     fills = [{"index": t.control.index, "token": t.token, "value": password} for t in targets]
-    result = bvt._eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
+    try:
+        result = bvt._eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
+    except Exception as exc:
+        result = {"success": False, "error": str(exc)}
     parsed: Any = bvt._parse_json_result(result.get("result")) if result.get("success") else None
     if isinstance(parsed, str):
         parsed = bvt._parse_json_result(parsed)
     landed = isinstance(parsed, dict) and not parsed.get("refused") and parsed.get("matched") == len(fills)
     if not landed:
         # The vault changes only when the page took the password: undo the save, so a new login is not left behind
-        # and an existing one keeps the password the site still has.
-        if previous:
+        # and an updated one keeps the password the site still has.
+        if existing is not None:
             store.set_password(meta.id, previous)
         else:
             store.remove_item(meta.id)
-        del password, previous
         if isinstance(parsed, dict) and parsed.get("refused") == "origin_changed":
             return _refuse("origin_changed", f"The page left {origin} before the password went in. Nothing was saved.")
         if not result.get("success"):
@@ -117,14 +131,13 @@ def browser_vault_set_password(identifier: str, label: str = "", task_id: Option
         took = parsed.get("matched", 0) if isinstance(parsed, dict) else 0
         return _refuse("fill_failed", (f"The page{where} kept the password in {took} of {len(fills)} new-password "
                                        "fields, so nothing was saved. Reload the page and try again once."))
-    del password, previous
     out: Dict[str, Any] = {
         "success": True, "handle": meta.id, "origin": origin, "identifier": identifier,
         "filled_fields": sum(t.token == "new-password" for t in targets),
         "confirmation_synced": any(t.token == "new-password-sync" for t in targets),
         "updated_existing": existing is not None,
-        "next": ("Submit the form now. The new password is saved under this handle; sign in later with "
-                 "browser_vault_fill. If the site rejects it, read its rules and call set_password again (each call "
-                 "makes a new password and replaces this one)."),
+        "next": ("Submit the form now and read the page's answer. The new password is saved under this handle; sign "
+                 "in later with browser_vault_fill. Only if the site rejects it, call set_password again: each call "
+                 "makes a new password and replaces this one, so never call it after the site accepted one."),
     }
     return json.dumps(out, ensure_ascii=False)
