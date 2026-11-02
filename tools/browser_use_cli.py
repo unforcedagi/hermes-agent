@@ -599,55 +599,118 @@ def exec_current_tab(session: str, task_id: Optional[str]) -> Tuple[Optional[Dic
     return None, redact_sensitive_text((ran[0].stderr or "").strip()[-300:], force=True) or "the browser session reported no current tab"
 
 
-# Harness daemon (its home/dirs + BU_NAME) -> the CDP endpoint this process last started it against. The harness
-# reads BU_CDP_* once, at spawn, and reuses ANY live daemon of the same name: every task's default session is
-# BU_NAME "default", but each task gets its own browser. Without this, task B's code ran in task A's browser while
-# B's vault supervisor sat on B's own blank tab (11-02: page_info on the login page, the vault on
-# chrome://new-tab-page). Another process (CLI, worker) using the same name is the same case.
-_daemon_endpoints: Dict[Tuple[str, ...], str] = {}
-_daemon_busy: Dict[Tuple[str, ...], int] = {}  # calls running on (or re-binding) each daemon in this process
-_daemon_endpoints_lock = threading.Lock()
-_DAEMON_ENV_KEYS = ("BH_HOME", "BROWSER_HARNESS_HOME", "XDG_CONFIG_HOME", "HOME", "BH_RUNTIME_DIR", "BH_TMP_DIR")
+# The harness reads BU_CDP_* once, when it spawns a daemon, and reuses ANY live daemon of the same BU_NAME. Every
+# task's default session is BU_NAME "default", but each task gets its own browser: task B's code ran in task A's
+# browser while B's vault supervisor sat on B's own blank tab (11-02: page_info on the login page, the vault on
+# chrome://new-tab-page). A CLI or worker process using the same name is the same case. So each daemon gets a
+# record of the endpoint it was started against, shared by every Hermes process (files next to the harness's own
+# socket), and a call routed to another endpoint restarts it first (`browser-use --reload`, scoped by BU_NAME).
+# A call holds a shared lock on the daemon while it runs; a restart needs the exclusive one, so a running call
+# (here or in another process) is never cut off: the other caller is told the session is busy.
 _DAEMON_BUSY = ("This browser session's driver is busy with another conversation's browser right now. Retry in a "
                 "moment, or give this conversation its own named session (session=...).")
+_daemon_endpoints: Dict[Tuple[str, ...], str] = {}  # Windows (no flock): this process's record only
+_daemon_busy: Dict[Tuple[str, ...], int] = {}
+_daemon_endpoints_lock = threading.Lock()
 
 
-def _claim_daemon(cmd: List[str], env: dict) -> Tuple[Optional[Tuple[str, ...]], Optional[str]]:
-    """Claim the harness daemon this call will use, started against ``env``'s CDP endpoint: when this process has
-    not bound that daemon to it yet, stop it (``browser-use --reload``, scoped by BU_NAME) so the call spawns a
-    fresh one. A daemon bound elsewhere loses its current tab on the switch (driving the wrong browser is worse);
-    one with a call still running is never stopped, the caller is told to retry. Returns ``(claim, error)``;
-    release the claim with :func:`_release_daemon` when the call ends."""
+def _daemon_files(env: dict) -> Tuple[Path, str]:
+    """The harness runtime dir and socket stem of the daemon a call with ``env`` drives (browser_harness ``_ipc``:
+    ``<runtime>/bu-<BU_NAME>.sock``, or ``bu.sock`` in an isolated, unshared runtime dir)."""
+    isolated = env.get("BH_RUNTIME_DIR") or env.get("BH_TMP_DIR")
+    if isolated:
+        runtime = Path(isolated).expanduser()
+    else:
+        home = env.get("BH_HOME") or env.get("BROWSER_HARNESS_HOME")
+        if home:
+            root = Path(home).expanduser()
+        elif env.get("XDG_CONFIG_HOME"):
+            root = Path(env["XDG_CONFIG_HOME"]).expanduser() / "browser-harness"
+        else:
+            root = Path(env.get("HOME") or Path.home()).expanduser() / ".config" / "browser-harness"
+        runtime = root / "runtime"
+    shared = not isolated or env.get("BH_RUNTIME_DIR_SHARED") == "1"
+    return runtime, (f"bu-{env.get('BU_NAME') or 'default'}" if shared else "bu")
+
+
+def _reload_daemon(cmd: List[str], env: dict, timeout: int) -> Optional[str]:
+    try:
+        proc = _run_cli_killing_process_group(cmd + ["--reload"], "", env, timeout)
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"Could not restart the browser session's driver for its browser: {e}"
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip()[-300:]
+        return f"Could not restart the browser session's driver for its browser: {tail or proc.returncode}"
+    return None
+
+
+def _claim_daemon(cmd: List[str], env: dict, timeout: int = _DEFAULT_TIMEOUT_S) -> Tuple[Any, Optional[str]]:
+    """Claim the harness daemon this call will use, bound to ``env``'s CDP endpoint (restarting it when it was
+    started against another one). Returns ``(claim, error)``; release the claim with :func:`_release_daemon`."""
     cdp = env.get("BU_CDP_WS") or env.get("BU_CDP_URL") or ""
     if not cdp:  # BU direct cloud: the daemon owns its own browser
         return None, None
-    key = (*(env.get(k, "") for k in _DAEMON_ENV_KEYS), env.get("BU_NAME", "default"))
+    if os.name == "nt":
+        return _claim_daemon_in_process(cmd, env, cdp, timeout)
+    import fcntl
+    runtime, stem = _daemon_files(env)
+    runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
+    record = runtime / f"{stem}.hermes-endpoint"
+    lock = open(runtime / f"{stem}.hermes-lock", "a+")
+    bound = lambda: record.read_text(encoding="utf-8") if record.exists() else ""  # noqa: E731
+    try:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:  # a call is running on it, or a restart is under way: join only if it is ours
+            fcntl.flock(lock, fcntl.LOCK_SH)
+            if bound() != cdp:
+                raise LookupError(_DAEMON_BUSY)
+            return lock, None
+        if bound() != cdp:
+            err = _reload_daemon(cmd, env, timeout)
+            if err:
+                raise LookupError(err)
+            record.write_text(cdp, encoding="utf-8")
+        fcntl.flock(lock, fcntl.LOCK_SH)  # not atomic: another caller may restart it in between, so check again
+        if bound() != cdp:
+            raise LookupError(_DAEMON_BUSY)
+        return lock, None
+    except LookupError as e:
+        lock.close()
+        return None, str(e)
+    except BaseException:
+        lock.close()
+        raise
+
+
+def _claim_daemon_in_process(cmd: List[str], env: dict, cdp: str, timeout: int) -> Tuple[Any, Optional[str]]:
+    runtime, stem = _daemon_files(env)
+    key = (str(runtime), stem)
     with _daemon_endpoints_lock:
         if _daemon_endpoints.get(key) == cdp:
             _daemon_busy[key] = _daemon_busy.get(key, 0) + 1
             return key, None
         if _daemon_busy.get(key):
             return None, _DAEMON_BUSY
-        _daemon_busy[key] = 1  # re-binding: concurrent calls on this name wait for it
+        _daemon_busy[key] = 1
         _daemon_endpoints.pop(key, None)
-    try:
-        proc = subprocess.run(cmd + ["--reload"], env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                              encoding="utf-8", errors="replace", timeout=60, **_group_popen_kwargs())
-        err = None if proc.returncode == 0 else ((proc.stderr or proc.stdout or "").strip()[-300:] or str(proc.returncode))
-    except (OSError, subprocess.SubprocessError) as e:
-        err = str(e)
+    err = _reload_daemon(cmd, env, timeout)
     if err:
         _release_daemon(key)
-        return None, f"Could not restart the browser session's driver for its browser: {err}"
+        return None, err
     with _daemon_endpoints_lock:
         _daemon_endpoints[key] = cdp
     return key, None
 
 
-def _release_daemon(key: Optional[Tuple[str, ...]]) -> None:
-    if key is not None:
+def _release_daemon(claim: Any) -> None:
+    if claim is None:
+        return
+    if isinstance(claim, tuple):
         with _daemon_endpoints_lock:
-            _daemon_busy[key] = max(0, _daemon_busy.get(key, 0) - 1)
+            _daemon_busy[claim] = max(0, _daemon_busy.get(claim, 0) - 1)
+    else:
+        claim.close()  # closing the file drops its flock
 
 
 def _attach_vault_supervisor(env: dict, task_id: Optional[str]) -> None:
@@ -698,7 +761,7 @@ def _group_popen_kwargs() -> dict:
 def _clamp_timeout(timeout_s: Any) -> int:
     try:
         return max(_MIN_TIMEOUT_S, min(int(timeout_s), _MAX_TIMEOUT_S))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # OverflowError: a JSON 1e400 arrives as inf
         return _DEFAULT_TIMEOUT_S
 
 
@@ -785,10 +848,10 @@ def _run_exec(code: str, session: str, timeout_s: Any, task_id: Optional[str],
     if "BU_AUTOSPAWN" not in env and is_legacy_browser_use_cloud_config(_read_browser_cfg()):
         env["BU_AUTOSPAWN"] = "1"
 
-    claim, claim_err = _claim_daemon(cmd, env)
+    timeout = _clamp_timeout(timeout_s)
+    claim, claim_err = _claim_daemon(cmd, env, timeout)
     if claim_err:
         return claim_err
-    timeout = _clamp_timeout(timeout_s)
     started = time.time()
     try:
         return _run_cli_killing_process_group(cmd, code, env, timeout), workspace, started

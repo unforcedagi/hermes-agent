@@ -1573,42 +1573,64 @@ class TestScreenshotFrontPreamble:
 
 
 @pytest.mark.linux_only
-def test_harness_daemon_is_restarted_when_its_name_is_routed_to_another_browser(tmp_path, monkeypatch):
+def test_harness_daemon_is_restarted_when_its_name_is_routed_to_another_browser(tmp_path):
     """T-335: every task's default session is BU_NAME "default", but each task has its own browser, and the
-    harness reuses any live daemon of a name. A daemon started for one browser must be stopped (--reload) before
-    a call routed to another browser uses that name; the same name on the same browser is left alone."""
+    harness reuses any live daemon of a name. A daemon started for one browser is stopped (--reload) before a call
+    routed to another browser uses that name; the same name on the same browser is left alone, also for a later
+    process (the record lives next to the harness's socket); a call still running is never cut off."""
     import tools.browser_use_cli as bu
 
     log = tmp_path / "calls.log"
     fake = tmp_path / "browser-use"
     fake.write_text(f"#!/bin/sh\necho \"$BU_NAME|$BU_CDP_WS|$*\" >> {log}\n")
     fake.chmod(0o755)
-    monkeypatch.setattr(bu, "_daemon_endpoints", {})
-
-    monkeypatch.setattr(bu, "_daemon_busy", {})
 
     def env_for(name, cdp):
-        return {"PATH": os.environ.get("PATH", ""), "BU_CDP_WS": cdp, **({"BU_NAME": name} if name else {})}
+        return {"PATH": os.environ.get("PATH", ""), "BH_HOME": str(tmp_path / "bh"), "BU_CDP_WS": cdp,
+                **({"BU_NAME": name} if name else {})}
 
     def bind(name, cdp):
-        key, err = bu._claim_daemon([str(fake)], env_for(name, cdp))
+        claim, err = bu._claim_daemon([str(fake)], env_for(name, cdp), 30)
         assert err is None
-        bu._release_daemon(key)
+        bu._release_daemon(claim)
 
-    bind("", "ws://a")      # first use in this process: whatever runs under "default" may be another browser's
-    bind("", "ws://a")      # same browser: keep the daemon (and its current tab)
-    bind("", "ws://b")      # another task's browser under the same name: restart
+    bind("", "ws://a")        # nothing recorded yet: whatever runs under "default" may be another browser's
+    bind("", "ws://a")        # same browser: keep the daemon (and its current tab)
+    bind("", "ws://b")        # another task's browser under the same name: restart
     bind("kajabi", "ws://b")  # another name is another daemon
     bind("", "ws://b")
-    assert log.read_text().splitlines() == ["|ws://a|--reload", "|ws://b|--reload", "kajabi|ws://b|--reload"]
-    assert bu._claim_daemon([str(fake)], {"PATH": os.environ.get("PATH", "")}) == (None, None)  # no CDP (BU cloud)
-    assert len(log.read_text().splitlines()) == 3
+    calls = lambda: log.read_text().splitlines()  # noqa: E731
+    assert calls() == ["|ws://a|--reload", "|ws://b|--reload", "kajabi|ws://b|--reload"]
+    assert bu._claim_daemon([str(fake)], {"PATH": os.environ.get("PATH", "")}) == (None, None)  # no CDP: BU cloud
 
-    # A call still running on the daemon is never cut off by another browser's call: that one is told to wait.
-    running, _ = bu._claim_daemon([str(fake)], env_for("", "ws://b"))
-    key, err = bu._claim_daemon([str(fake)], env_for("", "ws://c"))
-    assert key is None and "busy" in err and len(log.read_text().splitlines()) == 3
+    running, _ = bu._claim_daemon([str(fake)], env_for("", "ws://b"), 30)
+    joined, err = bu._claim_daemon([str(fake)], env_for("", "ws://b"), 30)  # same browser: runs alongside
+    assert err is None
+    other, err = bu._claim_daemon([str(fake)], env_for("", "ws://c"), 30)  # another browser: told to wait
+    assert other is None and "busy" in err and len(calls()) == 3
     bu._release_daemon(running)
-    key, err = bu._claim_daemon([str(fake)], env_for("", "ws://c"))
-    assert err is None and log.read_text().splitlines()[-1] == "|ws://c|--reload"
-    bu._release_daemon(key)
+    bu._release_daemon(joined)
+    claim, err = bu._claim_daemon([str(fake)], env_for("", "ws://c"), 30)
+    assert err is None and calls()[-1] == "|ws://c|--reload"
+    bu._release_daemon(claim)
+
+
+@pytest.mark.linux_only
+def test_a_browser_exec_releases_its_daemon_whatever_happens(tmp_path, monkeypatch):
+    """Through the real call path: each task's browser gets the daemon restarted for it, and a run with an absurd
+    timeout (a JSON 1e400 arrives as inf) neither raises nor leaves the daemon claimed, so the next call for another
+    browser restarts it instead of being told it is busy."""
+    import tools.browser_use_cli as bu
+
+    log = tmp_path / "calls.log"
+    fake = tmp_path / "browser-use"
+    fake.write_text(f"#!/bin/sh\necho \"$BU_CDP_WS|$*\" >> {log}\ncat >/dev/null\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("BH_HOME", str(tmp_path / "bh"))
+    monkeypatch.setattr(bu, "_find_cli", lambda: [str(fake)])
+    monkeypatch.setattr(bu, "_attach_vault_supervisor", lambda env, task_id: None)  # no browser behind ws://
+    for task, cdp, timeout in (("t1", "ws://a", 30), ("t2", "ws://b", float("inf")), ("t1", "ws://a", 30)):
+        monkeypatch.setattr(bu, "_route_backend", lambda env, *a, _c=cdp: env.update(BU_CDP_WS=_c))
+        ran = bu._run_exec("print(1)", "", timeout, task, False)
+        assert not isinstance(ran, str), ran
+    assert [line.split("|")[1] for line in log.read_text().splitlines()].count("--reload") == 3
