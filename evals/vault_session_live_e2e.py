@@ -120,6 +120,16 @@ def _page_value(session: str, selector: str, raw: bool = False) -> str:
     return out[::-1]
 
 
+def _stop_harness_daemons(bh_home: Path) -> None:
+    """Stop the harness daemons this run started under its own BH_HOME (the harness never reaps them)."""
+    from tools import browser_use_cli as bu
+
+    cmd = bu._find_cli()
+    for pid_file in (bh_home / "runtime").glob("bu-*.pid") if cmd else ():
+        env = {**os.environ, "BH_HOME": str(bh_home), "BU_NAME": pid_file.stem[3:]}
+        subprocess.run(cmd + ["--reload"], env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
+
+
 def main() -> int:
     srv = _https_server()
     port = srv.server_address[1]
@@ -231,6 +241,7 @@ def main() -> int:
         except Exception:
             pass
         srv.shutdown()
+        _stop_harness_daemons(HOME / "bh")
 
     failed = [n for n, ok, _ in results if not ok]
     print(f"\n{len(results) - len(failed)}/{len(results)} checks passed")

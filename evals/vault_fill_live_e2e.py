@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import http.server
 import json
+import subprocess
 import os
 import sys
 import tempfile
@@ -53,6 +54,16 @@ def _exec(code: str) -> dict:
     out = json.loads(bu.browser_exec(code, task_id=TASK, timeout_s=90))
     assert out.get("success"), out
     return out
+
+
+def _stop_harness_daemons(bh_home: Path) -> None:
+    """Stop the harness daemons this run started under its own BH_HOME (the harness never reaps them)."""
+    from tools import browser_use_cli as bu
+
+    cmd = bu._find_cli()
+    for pid_file in (bh_home / "runtime").glob("bu-*.pid") if cmd else ():
+        env = {**os.environ, "BH_HOME": str(bh_home), "BU_NAME": pid_file.stem[3:]}
+        subprocess.run(cmd + ["--reload"], env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
 
 
 def main() -> int:
@@ -143,6 +154,7 @@ def main() -> int:
         except Exception:
             pass
         srv.shutdown()
+        _stop_harness_daemons(HOME / "bh")
 
 
 if __name__ == "__main__":
