@@ -1585,9 +1585,15 @@ def test_harness_daemon_is_restarted_when_its_name_is_routed_to_another_browser(
     fake.chmod(0o755)
     monkeypatch.setattr(bu, "_daemon_endpoints", {})
 
+    monkeypatch.setattr(bu, "_daemon_busy", {})
+
+    def env_for(name, cdp):
+        return {"PATH": os.environ.get("PATH", ""), "BU_CDP_WS": cdp, **({"BU_NAME": name} if name else {})}
+
     def bind(name, cdp):
-        env = {"PATH": os.environ.get("PATH", ""), "BU_CDP_WS": cdp, **({"BU_NAME": name} if name else {})}
-        assert bu._bind_daemon([str(fake)], env) is None
+        key, err = bu._claim_daemon([str(fake)], env_for(name, cdp))
+        assert err is None
+        bu._release_daemon(key)
 
     bind("", "ws://a")      # first use in this process: whatever runs under "default" may be another browser's
     bind("", "ws://a")      # same browser: keep the daemon (and its current tab)
@@ -1595,5 +1601,14 @@ def test_harness_daemon_is_restarted_when_its_name_is_routed_to_another_browser(
     bind("kajabi", "ws://b")  # another name is another daemon
     bind("", "ws://b")
     assert log.read_text().splitlines() == ["|ws://a|--reload", "|ws://b|--reload", "kajabi|ws://b|--reload"]
-    assert bu._bind_daemon([str(fake)], {"PATH": os.environ.get("PATH", "")}) is None  # no CDP (BU cloud): untouched
+    assert bu._claim_daemon([str(fake)], {"PATH": os.environ.get("PATH", "")}) == (None, None)  # no CDP (BU cloud)
     assert len(log.read_text().splitlines()) == 3
+
+    # A call still running on the daemon is never cut off by another browser's call: that one is told to wait.
+    running, _ = bu._claim_daemon([str(fake)], env_for("", "ws://b"))
+    key, err = bu._claim_daemon([str(fake)], env_for("", "ws://c"))
+    assert key is None and "busy" in err and len(log.read_text().splitlines()) == 3
+    bu._release_daemon(running)
+    key, err = bu._claim_daemon([str(fake)], env_for("", "ws://c"))
+    assert err is None and log.read_text().splitlines()[-1] == "|ws://c|--reload"
+    bu._release_daemon(key)
