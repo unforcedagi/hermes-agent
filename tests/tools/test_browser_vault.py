@@ -45,6 +45,14 @@ def store(tmp_path):
     return VaultStore(base_dir=tmp_path / "vault")
 
 
+@pytest.fixture(autouse=True)
+def _builtin_browser_by_default(monkeypatch):
+    """The built-in browser tools unless a test opts into Browser Use mode (whose real CLI may be on this PATH)."""
+    from tools import browser_vault_tool
+
+    monkeypatch.setattr(browser_vault_tool, "_browser_use_mode", lambda: False, raising=False)
+
+
 def _add_login(store, origin="https://example.com", password="s3cret-pw"):
     return store.add_item(
         kind="login",
@@ -239,7 +247,7 @@ class TestClassifier:
         assert "vaultSecret" not in js
         assert "data-vault-secret" not in js
         assert "elements[f.index]" not in js
-        assert "[data-hermes-vault-slot=" in js and "nonce + ':' + f.index" in js
+        assert '"[data-hermes-vault-slot]"' in js and 'nonce + ":" + f.index' in js
         assert 'f.token === "current-password" && el.type !== "password"' in js  # a password fill never lands in a text box
         assert js.index('removeAttribute("data-hermes-vault-slot")') > js.index("setter.set.call")
 
@@ -296,7 +304,7 @@ class TestBrowserVaultTools:
 
         meta = _add_login(store, origin="https://example.com")
         with patch("agent.vault_store.get_vault_store", return_value=store), \
-             patch.object(browser_vault_tool, "_current_page_origin", return_value="https://evil.com"):
+             patch.object(browser_vault_tool, "_page_origin", return_value=("https://evil.com", None)):
             out = json.loads(browser_vault_tool.browser_vault_fill(meta.id))
         assert out["success"] is False
         assert "Refused" in out["error"]
@@ -346,7 +354,7 @@ class TestBrowserVaultTools:
             return {"success": True, "result": json.dumps({"filled": 1})}
 
         with patch("agent.vault_backends.backend_for_handle", return_value=_ManagerBackend()), \
-             patch.object(browser_vault_tool, "_current_page_origin", return_value="https://www.amazon.co.uk"), \
+             patch.object(browser_vault_tool, "_page_origin", return_value=("https://www.amazon.co.uk", None)), \
              patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval), \
              patch.object(browser_vault_tool, "_eval_js_secret", side_effect=fake_eval_secret):
             raw = browser_vault_tool.browser_vault_fill("op:multi")
@@ -378,7 +386,7 @@ class TestBrowserVaultTools:
                 return "s3cret-pw"
 
         with patch("agent.vault_backends.backend_for_handle", return_value=_ManagerBackend()), \
-             patch.object(browser_vault_tool, "_current_page_origin", return_value="https://payments.amazon.co.uk"):
+             patch.object(browser_vault_tool, "_page_origin", return_value=("https://payments.amazon.co.uk", None)):
             out = json.loads(browser_vault_tool.browser_vault_fill("op:multi"))
         assert out["success"] is False
         assert out["error_type"] == "origin_mismatch"
@@ -709,9 +717,9 @@ class TestSaveLoginPrompt:
             return {"identifier": "tek@acme.test", "password": "hunter2-very-secret"}
 
         unlock_mod.set_save_login_prompt_callback(prompt)
-        monkeypatch.setattr(browser_vault_tool, "_current_page_origin", lambda task_id: "https://acme.test")
+        monkeypatch.setattr(browser_vault_tool, "_page_origin", lambda task_id, where="": ("https://acme.test", None))
         monkeypatch.setattr(browser_vault_tool, "browser_vault_fill",
-                            lambda handle, task_id=None: json.dumps({"success": True, "filled_fields": 1}))
+                            lambda handle, task_id=None, session="": json.dumps({"success": True, "filled_fields": 1}))
         with patch("agent.vault_store.get_vault_store", return_value=store), \
              patch("agent.vault_backends.unlock.can_prompt_here", return_value=True):
             out = json.loads(browser_vault_tool.browser_vault_save_login(task_id="t1"))
@@ -727,7 +735,7 @@ class TestSaveLoginPrompt:
         from agent.vault_backends import unlock as unlock_mod
         from tools import browser_vault_tool
 
-        monkeypatch.setattr(browser_vault_tool, "_current_page_origin", lambda task_id: "https://acme.test")
+        monkeypatch.setattr(browser_vault_tool, "_page_origin", lambda task_id, where="": ("https://acme.test", None))
         with patch("agent.vault_store.get_vault_store", return_value=store):
             unlock_mod.set_save_login_prompt_callback(lambda origin, site: None)
             with patch("agent.vault_backends.unlock.can_prompt_here", return_value=True):
@@ -866,3 +874,166 @@ class TestTwoFactor:
              patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval):
             out = json.loads(browser_vault_tool.browser_vault_enter_code(task_id="t"))
         assert out["error_type"] == "no_code_field" and "device" in out["error"]
+
+
+class _FakeTab:
+    """One browser tab as the supervisor sees it."""
+
+    def __init__(self, url):
+        self.url = url
+
+
+class _FakeBrowserUse:
+    """The Browser Use side of the vault: each named session's daemon is on one tab, and the per-task supervisor
+    evaluates on whichever tab it was last pointed at. Faked at the browser boundary: no Chromium in unit tests."""
+
+    def __init__(self, tabs):
+        self.tabs = tabs  # session name ("" = default) -> (target id, url)
+        self.focused = None
+        self.asked_tabs = []
+
+    def exec_current_tab(self, session, task_id):
+        self.asked_tabs.append(session)
+        tid, url = self.tabs[session]
+        return {"targetId": tid, "url": url}, None
+
+    def focus_target(self, target_id):
+        self.focused = next(url for tid, url in self.tabs.values() if tid == target_id)
+        return {"ok": True, "url": self.focused}
+
+    def evaluate_runtime(self, expression):
+        assert expression == "window.location.href"
+        return {"ok": True, "result": self.focused}
+
+
+@pytest.fixture()
+def browser_use(monkeypatch):
+    """Browser Use mode with a 'kajabi' session on a login page and the default session on a new-tab page
+    (the 11-02 report). The default session was driven LAST, as when the agent checked something else."""
+    from tools import browser_use_cli, browser_vault_tool
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+    fake = _FakeBrowserUse({"kajabi": ("K1", "https://app.kajabi.test/password/edit"), "": ("D1", "chrome://new-tab-page/")})
+    monkeypatch.setattr(browser_vault_tool, "_browser_use_mode", lambda: True)
+    monkeypatch.setattr(browser_use_cli, "exec_current_tab", fake.exec_current_tab)
+    monkeypatch.setattr(SUPERVISOR_REGISTRY, "get", lambda task_id: fake)
+    monkeypatch.setattr(browser_use_cli, "_exec_sessions", {})
+    browser_use_cli._record_exec_session("t1", "kajabi", False)
+    browser_use_cli._record_exec_session("t1", "", False)
+    return fake
+
+
+class TestVaultActsOnTheBrowserExecTab:
+    """T-335: the vault tools act on the exact tab browser_exec is on, in the session the page is in, and never
+    bind or fill a page that is not a website."""
+
+    @staticmethod
+    def _save(store, prompt, **args):
+        from agent.vault_backends import unlock as unlock_mod
+        from tools.registry import registry
+
+        unlock_mod.set_save_login_prompt_callback(prompt)
+        try:
+            with patch("agent.vault_store.get_vault_store", return_value=store), \
+                 patch("agent.vault_backends.unlock.can_prompt_here", return_value=True):
+                return json.loads(registry.dispatch("browser_vault_save_login", args, task_id="t1"))
+        finally:
+            unlock_mod.set_save_login_prompt_callback(None)
+
+    def test_save_login_binds_the_named_sessions_tab_and_fills_in_that_session(self, store, browser_use, monkeypatch):
+        from tools import browser_vault_tool
+
+        asked, fills = [], []
+        monkeypatch.setattr(browser_vault_tool, "browser_vault_fill",
+                            lambda handle, task_id=None, session="": fills.append(session) or json.dumps({"success": True}))
+        out = self._save(store, lambda origin, host: asked.append(origin) or {"identifier": "uni-test@example.invalid",
+                                                                               "password": "pw-1"}, session="kajabi")
+        assert out["success"] is True and out["origin"] == "https://app.kajabi.test"
+        assert asked == ["https://app.kajabi.test"] and browser_use.asked_tabs == ["kajabi"]
+        assert fills == ["kajabi"]  # the fill (and its origin check) runs in the same session
+        assert [m.origin for m in store.list_items()] == ["https://app.kajabi.test"]
+
+    def test_without_a_session_the_last_driven_session_is_used(self, store, browser_use):
+        from tools import browser_use_cli
+
+        browser_use_cli._record_exec_session("t1", "kajabi", False)  # kajabi driven last now
+        with patch("tools.browser_vault_tool.browser_vault_fill", lambda *a, **k: json.dumps({"success": True})):
+            out = self._save(store, lambda origin, host: {"identifier": "uni-test@example.invalid", "password": "pw-1"})
+        assert out["origin"] == "https://app.kajabi.test" and browser_use.asked_tabs == ["kajabi"]
+
+    @pytest.mark.parametrize("url", ["chrome://new-tab-page/", "about:blank", "data:text/html,<input type=password>",
+                                     "file:///etc/hosts", "chrome-error://chromewebdata/", ""])
+    @pytest.mark.parametrize("mode", ["browser_use", "builtin"])
+    def test_non_website_tabs_are_refused_before_anyone_is_asked(self, store, monkeypatch, url, mode, request):
+        from tools import browser_vault_tool
+
+        if mode == "browser_use":
+            request.getfixturevalue("browser_use").tabs[""] = ("D1", url)
+        else:
+            monkeypatch.setattr(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None)
+            monkeypatch.setattr(browser_vault_tool, "_eval_js", lambda task_id, expr: {"success": True, "result": url})
+        asked = []
+        out = self._save(store, lambda origin, host: asked.append(origin))
+        assert out["success"] is False and out["error_type"] == "not_a_website", out
+        assert asked == [] and store.list_items() == []
+        code = json.loads(browser_vault_tool.browser_vault_enter_code(task_id="t1"))
+        assert code["error_type"] == "not_a_website"
+
+    def test_fill_checks_the_origin_of_the_sessions_tab_not_another_matching_tab(self, store, browser_use, monkeypatch):
+        from tools import browser_vault_tool
+
+        meta = _add_login(store, origin="https://app.kajabi.test")
+        browser_use.tabs["kajabi"] = ("K1", "https://evil.test/login")
+        browser_use.tabs[""] = ("D1", "https://app.kajabi.test/login")  # a matching tab in another session
+        monkeypatch.setattr(browser_vault_tool, "_focus_bound_origin",
+                            lambda *a, **k: pytest.fail("Browser Use mode must not hop to another tab"))
+        with patch("agent.vault_store.get_vault_store", return_value=store):
+            out = json.loads(browser_vault_tool.browser_vault_fill(meta.id, task_id="t1", session="kajabi"))
+        assert out["error_type"] == "origin_mismatch" and "https://evil.test" in out["error"]
+        assert "s3cret-pw" not in json.dumps(out)
+
+    def test_session_is_in_the_schema_only_in_browser_use_mode(self, monkeypatch):
+        from tools import browser_vault_tool
+
+        for schema in (browser_vault_tool.BROWSER_VAULT_FILL_SCHEMA, browser_vault_tool.BROWSER_VAULT_SAVE_LOGIN_SCHEMA,
+                       browser_vault_tool.BROWSER_VAULT_ENTER_CODE_SCHEMA):
+            overrides = browser_vault_tool._session_schema_overrides(schema)
+            assert overrides() is None  # built-in browser tools: no sessions, no extra surface
+            with patch.object(browser_vault_tool, "_browser_use_mode", lambda: True):
+                params = overrides()["parameters"]
+            assert "session" in params["properties"] and params["required"] == schema["parameters"]["required"]
+            assert set(schema["parameters"]["properties"]) < set(params["properties"])
+
+
+class TestIdentifierThatLooksLikeAPassword:
+    """T-335: the user typed their password into the username card on Buzz, and save_login echoed it to the agent."""
+
+    @pytest.mark.parametrize("identifier", ["Xk9#mP2$vL7q", "Hunter2Pass", "k3j9x0q2m8w1", "correct horse battery"])
+    def test_masked_in_the_save_result_and_in_list(self, store, monkeypatch, identifier):
+        from tools import browser_vault_tool
+
+        monkeypatch.setattr(browser_vault_tool, "_page_origin", lambda task_id, where="": ("https://acme.test", None))
+        monkeypatch.setattr(browser_vault_tool, "browser_vault_fill", lambda *a, **k: json.dumps({"success": True}))
+        out = TestVaultActsOnTheBrowserExecTab._save(store, lambda o, h: {"identifier": identifier, "password": "pw-Real-77"})
+        assert out["success"] is True and out["identifier_masked"] is True
+        assert identifier not in json.dumps(out) and "looks like a password" in out["next"]
+        with patch("agent.vault_store.get_vault_store", return_value=store):
+            listed = browser_vault_tool.browser_vault_list()
+        assert identifier not in listed and json.loads(listed)["items"][0]["identifier_masked"] is True
+
+    def test_identifier_equal_to_the_password_is_not_saved(self, store, monkeypatch):
+        from tools import browser_vault_tool
+
+        monkeypatch.setattr(browser_vault_tool, "_page_origin", lambda task_id, where="": ("https://acme.test", None))
+        out = TestVaultActsOnTheBrowserExecTab._save(store, lambda o, h: {"identifier": "sunshine", "password": "sunshine"})
+        assert out["error_type"] == "identifier_is_password" and "sunshine" not in json.dumps(out)
+        assert store.list_items() == []
+
+    @pytest.mark.parametrize("identifier", ["uni-test@example.invalid", "aaron_g", "john.smith2", "+1 (555) 123-4567"])
+    def test_ordinary_usernames_come_back(self, store, monkeypatch, identifier):
+        from tools import browser_vault_tool
+
+        monkeypatch.setattr(browser_vault_tool, "_page_origin", lambda task_id, where="": ("https://acme.test", None))
+        monkeypatch.setattr(browser_vault_tool, "browser_vault_fill", lambda *a, **k: json.dumps({"success": True}))
+        out = TestVaultActsOnTheBrowserExecTab._save(store, lambda o, h: {"identifier": identifier, "password": "pw-Real-77"})
+        assert out["identifier"] == identifier and "identifier_masked" not in out

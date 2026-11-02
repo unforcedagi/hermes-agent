@@ -548,6 +548,50 @@ def _resolve_real_profile_cdp(env: dict, force_local: bool) -> Optional[str]:
     return err or None
 
 
+# (task, served profile) → {session name ("" = default): its ``local`` flag}, most recently driven last. The vault
+# tools act in the last one when the model names none, and reach a session's browser with the flag it was driven with.
+_exec_sessions: Dict[str, Dict[str, bool]] = {}
+_CURRENT_TAB_MARK = "HERMES_CURRENT_TAB "
+_CURRENT_TAB_CODE = f"import json\nprint({_CURRENT_TAB_MARK!r} + json.dumps(current_tab()))"
+
+
+def _task_session_key(task_id: Optional[str]) -> str:
+    tag = _served_profile_tag()
+    return f"{task_id or 'default'}@{tag}" if tag else (task_id or "default")
+
+
+def last_exec_session(task_id: Optional[str]) -> Optional[str]:
+    """The session the task's last browser_exec drove ("" = default), or None when it has driven none."""
+    sessions = _exec_sessions.get(_task_session_key(task_id))
+    return next(reversed(sessions)) if sessions else None
+
+
+def _record_exec_session(task_id: Optional[str], session: str, local: bool) -> None:
+    sessions = _exec_sessions.setdefault(_task_session_key(task_id), {})
+    sessions.pop(session, None)
+    sessions[session] = local
+
+
+def exec_current_tab(session: str, task_id: Optional[str]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """``({"targetId", "url"}, None)`` for the tab browser_exec's daemon is on in ``session``, or ``(None, error)``.
+
+    Runs through browser_exec itself, so the same routing picks the same browser and the vault supervisor is
+    (re)attached to it for ``task_id``."""
+    local = (_exec_sessions.get(_task_session_key(task_id)) or {}).get(session, False)
+    ran = _run_exec(_CURRENT_TAB_CODE, session, 60, task_id, local)
+    if isinstance(ran, str):
+        return None, ran[:300]
+    # Raw stdout, never shown to the model: the model-facing output redacts registered vault values, which can
+    # mangle a target id (a card's expiry month "7" is one of them).
+    for line in (ran[0].stdout or "").splitlines():
+        if line.startswith(_CURRENT_TAB_MARK):
+            tab = json.loads(line[len(_CURRENT_TAB_MARK):])
+            if tab.get("targetId"):
+                return {"targetId": tab["targetId"], "url": str(tab.get("url") or "")}, None
+    from agent.redact import redact_sensitive_text
+    return None, redact_sensitive_text((ran[0].stderr or "").strip()[-300:], force=True) or "the browser session reported no current tab"
+
+
 def _attach_vault_supervisor(env: dict, task_id: Optional[str]) -> None:
     """Attach the per-task CDP supervisor to the browser this exec drives so ``browser_vault_fill`` has
     a secret-capable WebSocket (never argv) into the SAME browser. Only CDP-routed backends expose an
@@ -641,33 +685,30 @@ def _run_cli_killing_process_group(cmd, code, env, timeout):
     return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 
-def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT_S,
-                 task_id: Optional[str] = None, local: bool = False):
-    """Run Python code through the browser-use CLI, and return its output"""
-    from agent.redact import redact_sensitive_text
-    from tools.registry import tool_error, tool_result
-    if not code or not code.strip():
-        return tool_error("No code provided. Pass Python that uses the pre-imported helpers, e.g. new_tab(\"https://example.com\") then print(page_info()).")
-
+def _run_exec(code: str, session: str, timeout_s: Any, task_id: Optional[str],
+              local: bool) -> "Tuple[subprocess.CompletedProcess, Optional[str], float] | str":
+    """Route ``session`` to its browser and run ``code`` through the CLI there: ``(proc, workspace, started)``, or
+    an error string. Output is raw; only :func:`browser_exec` turns it into a model-facing result."""
     blocked = _blocked_url_in_code(code)
     if blocked:
-        return tool_error(blocked)
+        return blocked
 
     cmd = _find_cli()
     if not cmd:
-        return tool_error("browser-use CLI not found on PATH, and uvx is unavailable for a zero-install run. "
-                          "Install it with `uv tool install browser-use` (or `pipx install browser-use`), "
-                          "then run `browser-use --doctor` to verify the setup.")
+        return ("browser-use CLI not found on PATH, and uvx is unavailable for a zero-install run. "
+                "Install it with `uv tool install browser-use` (or `pipx install browser-use`), "
+                "then run `browser-use --doctor` to verify the setup.")
 
     env = _base_subprocess_env()
     if session:
         if not _SESSION_RE.match(session):
-            return tool_error(f"Invalid session name {session!r}: use 1-64 letters, digits, "
-                              "dashes, or underscores (e.g. 'r7k2').")
+            return (f"Invalid session name {session!r}: use 1-64 letters, digits, "
+                    "dashes, or underscores (e.g. 'r7k2').")
         env["BU_NAME"] = session
     route_err = _route_backend(env, session, task_id, bool(local))
     if route_err:
-        return tool_error(route_err)
+        return route_err
+    _record_exec_session(task_id, session, bool(local))
     _attach_vault_supervisor(env, task_id)
 
     # SHARED browser (/browser connect CDP override): pin each named session to its own tab (see
@@ -690,13 +731,26 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     timeout = _clamp_timeout(timeout_s)
     started = time.time()
     try:
-        proc = _run_cli_killing_process_group(cmd, code, env, timeout)
+        return _run_cli_killing_process_group(cmd, code, env, timeout), workspace, started
     except subprocess.TimeoutExpired:
-        return tool_error(f"browser-use exec timed out after {timeout}s. The daemon may still be working; retry "
-                          f"with a larger timeout_s (max {_MAX_TIMEOUT_S}), or split the work into several calls that "
-                          "append to workspace files — anything already written to the workspace is preserved.")
+        return (f"browser-use exec timed out after {timeout}s. The daemon may still be working; retry "
+                f"with a larger timeout_s (max {_MAX_TIMEOUT_S}), or split the work into several calls that "
+                "append to workspace files — anything already written to the workspace is preserved.")
     except OSError as e:
-        return tool_error(f"Failed to launch browser-use CLI: {e}")
+        return f"Failed to launch browser-use CLI: {e}"
+
+
+def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT_S,
+                 task_id: Optional[str] = None, local: bool = False):
+    """Run Python code through the browser-use CLI, and return its output"""
+    from agent.redact import redact_sensitive_text
+    from tools.registry import tool_error, tool_result
+    if not code or not code.strip():
+        return tool_error("No code provided. Pass Python that uses the pre-imported helpers, e.g. new_tab(\"https://example.com\") then print(page_info()).")
+    ran = _run_exec(code, session, timeout_s, task_id, local)
+    if isinstance(ran, str):
+        return tool_error(ran)
+    proc, workspace, started = ran
 
     # browser_vault_fill registers injected values with this forced model-egress
     # boundary. Preserve raw stdout only for screenshot-path detection below.

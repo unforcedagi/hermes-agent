@@ -245,9 +245,28 @@ def build_inspection_js(nonce: str) -> str:
     return _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE.replace("__NONCE__", json.dumps(nonce))
 
 
+# Every element matching ``sel`` in the document AND in every open shadow root, in tree order (a shadow root's
+# content right after its host). Design systems put login inputs inside web components (Kajabi's <pds-input>,
+# 11-02): document.querySelectorAll never sees them. Closed shadow roots stay out of reach, as they should.
+_DEEP_QUERY_JS = """const deepAll = (sel, root = document) => {
+    const out = [];
+    for (const el of root.querySelectorAll("*")) {
+      if (el.matches(sel)) out.push(el);
+      if (el.shadowRoot) out.push(...deepAll(sel, el.shadowRoot));
+    }
+    return out;
+  };"""
+
+
+def build_probe_js(selector: str) -> str:
+    """A JS expression, true when an element matching ``selector`` exists in the page or an open shadow root."""
+    return "(() => { " + _DEEP_QUERY_JS + " return deepAll(" + json.dumps(selector) + ").length > 0; })()"
+
+
 _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
   const nonce = __NONCE__;
-  const elements = Array.from(document.querySelectorAll("input, select"));
+  __DEEP_QUERY__
+  const elements = deepAll("input, select");
   const forms = Array.from(document.forms);
   elements.forEach((element, index) => element.setAttribute("data-hermes-vault-slot", nonce + ":" + index));
   const out = elements.flatMap((element, index) => {
@@ -256,10 +275,14 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
     const style = getComputedStyle(element);
     if (style.display === "none" || style.visibility === "hidden" || element.getClientRects().length === 0) return [];
     const labels = element.labels ? Array.from(element.labels, (l) => l.textContent || "") : [];
+    const root = element.getRootNode();
     const ariaText = (element.getAttribute("aria-labelledby") || "")
       .split(/\\s+/).filter(Boolean)
-      .map((id) => { const n = document.getElementById(id); return n ? (n.textContent || "") : ""; })
+      .map((id) => { const n = (root.getElementById ? root : document).getElementById(id); return n ? (n.textContent || "") : ""; })
       .join(" ");
+    // Inside a web component the host carries the label/name the page author wrote (<pds-input label="Password">).
+    const host = root instanceof ShadowRoot ? root.host : null;
+    const hostText = host ? ["label", "aria-label", "placeholder", "name"].map((a) => host.getAttribute(a) || "").join(" ") : "";
     const resolvedFormIndex = element.form ? forms.indexOf(element.form) : -1;
     return [{
       autocomplete: element.autocomplete || "",
@@ -272,13 +295,14 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
         ariaText,
         element.getAttribute("placeholder") || "",
         element.getAttribute("title") || "",
+        hostText,
       ].join(" "),
       name: [element.name, element.id].join(" "),
       type: element.tagName === "SELECT" ? "select" : (element.type || ""),
     }];
   });
   return JSON.stringify(out);
-})()"""
+})()""".replace("__DEEP_QUERY__", _DEEP_QUERY_JS)
 
 
 def build_fill_js(fills: List[Dict[str, Any]], expected_origin: str, nonce: str = "") -> str:
@@ -289,7 +313,9 @@ def build_fill_js(fills: List[Dict[str, Any]], expected_origin: str, nonce: str 
     evaluated script, immediately before any write. If the page navigated between inspection and fill
     (TOCTOU), the script writes nothing and returns ``{"refused": "origin_changed", "found": <actual>}``:
     proof scope equals mutation scope (#88706). Targets resolve by the ``<nonce>:<index>`` stamp of
-    THIS inspection; a ``current-password`` fill additionally requires ``type=password``; ``<select>``
+    THIS inspection, in the document and in open shadow roots alike; values go in through the native value setter
+    and ``input``/``change`` fire bubbling AND composed, so a listener outside a web component hears them. A
+    ``current-password`` fill additionally requires ``type=password``; ``<select>``
     controls (country, state, expiry month) match an option by value or visible text. No marker is
     left on filled controls so later model-driven DOM reads cannot address them deterministically.
     """
@@ -307,27 +333,29 @@ _FILL_JS_TEMPLATE = """(() => {
   }
   const fills = __FILLS__;
   const nonce = __NONCE__;
+  __DEEP_QUERY__
+  const stamped = deepAll("[data-hermes-vault-slot]");
   let filled = 0;
   const norm = (t) => String(t || "").trim().toLowerCase();
   for (const f of fills) {
-    const el = document.querySelector('[data-hermes-vault-slot="' + nonce + ':' + f.index + '"]');
+    const el = stamped.find((n) => n.getAttribute("data-hermes-vault-slot") === nonce + ":" + f.index);
     if (!el || (f.token === "current-password" && el.type !== "password")) continue;
     try {
       if (el.tagName === "SELECT") {
         const want = norm(f.value);
         const opt = Array.from(el.options).find((o) => [o.value, o.textContent].some((t) => norm(t) === want || norm(t) === want.replace(/^0/, "")));
-        if (opt) { el.value = opt.value; el.dispatchEvent(new Event("change", { bubbles: true })); filled += 1; }
+        if (opt) { el.value = opt.value; el.dispatchEvent(new Event("change", { bubbles: true, composed: true })); filled += 1; }
         continue;
       }
       el.focus();
       const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
       // one-time-code split into single-character boxes: f.value is the slice for THIS box (see build_otp_fills)
       if (setter && setter.set) { setter.set.call(el, f.value); } else { el.value = f.value; }
-      el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText" }));
-      el.dispatchEvent(new Event("change", { bubbles: true }));
+      el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText" }));
+      el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
       if (el.value.length > 0) filled += 1;
     } catch (e) { /* skip */ }
   }
-  document.querySelectorAll("[data-hermes-vault-slot]").forEach((n) => n.removeAttribute("data-hermes-vault-slot"));
+  stamped.forEach((n) => n.removeAttribute("data-hermes-vault-slot"));
   return JSON.stringify({ filled });
-})()"""
+})()""".replace("__DEEP_QUERY__", _DEEP_QUERY_JS)

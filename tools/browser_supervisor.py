@@ -274,13 +274,6 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         if loop is None or not loop.is_running():
             return _fail("supervisor loop is not running")
 
-        async def _attach(target_id: str) -> str:
-            attach = await self._cdp("Target.attachToTarget", {"targetId": target_id, "flatten": True}, timeout=timeout)
-            sid = attach["result"]["sessionId"]
-            await self._enable_page_domains(sid, timeout=timeout)
-            await self._install_dialog_bridge(sid)
-            return sid
-
         async def _focus() -> Dict[str, Any]:
             from agent.vault_store import normalize_origin
             targets = (await self._cdp("Target.getTargets", timeout=timeout)).get("result", {}).get("targetInfos", [])
@@ -295,7 +288,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
                 except Exception:
                     continue
             for target_id, url in candidates:
-                sid = await _attach(target_id)
+                sid = await self._attach_page(target_id, timeout=timeout)
                 if accept:
                     probe = await self._cdp("Runtime.evaluate", {"expression": accept, "returnByValue": True},
                                             session_id=sid, timeout=timeout)
@@ -312,7 +305,37 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         except Exception as exc:
             return _err(exc)
 
+    def focus_target(self, target_id: str, *, timeout: float = 10.0) -> Dict[str, Any]:
+        """Re-attach the page session to the exact page target ``target_id`` (the tab another driver, such as
+        the Browser Use daemon, is on). Returns ``{"ok": True, "url"}`` or ``{"ok": False, "error"}``; on failure
+        the previous session stays."""
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return _fail("supervisor loop is not running")
+
+        async def _focus() -> Dict[str, Any]:
+            info = (await self._cdp("Target.getTargetInfo", {"targetId": target_id}, timeout=timeout))["result"]["targetInfo"]
+            if info.get("type") != "page":
+                return _fail(f"target {target_id} is a {info.get('type')}, not a page")
+            sid = await self._attach_page(target_id, timeout=timeout)
+            with self._state_lock:
+                self._page_session_id = sid
+            return {"ok": True, "url": str(info.get("url") or "")}
+
+        try:
+            return _schedule(_focus(), loop, timeout=timeout + 1)
+        except Exception as exc:
+            return _err(exc)
+
     # ── Supervisor loop internals ────────────────────────────────────────────
+
+    async def _attach_page(self, target_id: str, *, timeout: float = 10.0) -> str:
+        """Attach (flattened) to a page target with the page domains and the dialog bridge; returns the session id."""
+        attach = await self._cdp("Target.attachToTarget", {"targetId": target_id, "flatten": True}, timeout=timeout)
+        sid = attach["result"]["sessionId"]
+        await self._enable_page_domains(sid, timeout=timeout)
+        await self._install_dialog_bridge(sid)
+        return sid
 
     def _thread_main(self) -> None:
         """Entry point for the supervisor's dedicated thread."""

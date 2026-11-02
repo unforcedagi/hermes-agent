@@ -1,9 +1,9 @@
 """Live E2E: vault fill through the REAL browser_exec path (Browser Use CLI + Hermes' packaged Chromium).
 
 Proves problem (1) of the #106480 re-review is fixed: on the default browser backend the login page lives in
-a tab browser_exec opened, the supervisor is attached by browser_exec itself, browser_vault_fill focuses the
-tab on the bound origin and injects the password over the supervisor's CDP WebSocket, and the secret is absent
-from every model-facing result. Also exercises a payment fill (confirm gate, card fields, decline = no write).
+a tab browser_exec opened, the supervisor is attached by browser_exec itself, browser_vault_fill acts on the
+exact tab browser_exec is on (T-335) and injects the password over the supervisor's CDP WebSocket, and the
+secret is absent from every model-facing result. Also exercises a payment fill (confirm gate, card fields, decline = no write).
 
 Run: HERMES_E2E_BROWSER=1 <venv>/bin/python evals/vault_fill_live_e2e.py
 """
@@ -80,6 +80,7 @@ def main() -> int:
         login = store.add_item("login", "site", {"identifier_type": "email", "identifier": "a@b.c", "password": "pw-E2E-8842"}, origin=origin)
         card = store.add_item("payment", "visa", {"card_number": "4111111111111111", "exp_month": "7", "exp_year": "2029", "cvc": "987"}, origin=origin)
 
+        _exec(f"switch_tab(list_tabs(False)[[t['url'] for t in list_tabs(False)].index({origin + '/login'!r})])")
         raw = bvt.browser_vault_fill(login.id, task_id=TASK)
         out = json.loads(raw)
         print("login fill:", out)
@@ -90,6 +91,7 @@ def main() -> int:
         assert "pw-E2E-8842" not in json.dumps(_redact_cdp_output({"result": {"value": dom["result"]}}))
         print("login: password landed in the /login tab; model-facing read is scrubbed")
 
+        _exec(f"switch_tab(list_tabs(False)[[t['url'] for t in list_tabs(False)].index({origin + '/checkout'!r})])")
         ap.request_elicitation_consent = lambda *a, **k: "decline"
         out = json.loads(bvt.browser_vault_fill(card.id, task_id=TASK))
         assert out["error_type"] == "payment_declined", out
@@ -108,12 +110,14 @@ def main() -> int:
         assert r.get("result") == "4111111111111111|07/29|987|DE|", r
         print("payment: card/expiry/cvc filled on the /checkout tab, email untouched, select untouched without a value")
 
-        # save-on-page: the supervisor's default page is the blank first tab; the tool must find the login
-        # tab itself (Browser Use daemon tabs are how a real session looks) and bind the item to ITS origin.
+        # save-on-page: the supervisor may sit on any tab (/checkout here); the tool must pin the tab
+        # browser_exec is on (the login page) and bind the item to ITS origin.
         from agent.vault_backends import unlock as vault_unlock
         store.remove_item(login.id)
         sup.evaluate_runtime("document.querySelector('input[name=pw]') && (document.querySelector('input[name=pw]').value = '')")
         assert sup.focus_page("about:blank")["ok"] is False  # about: pages are never candidates
+        _exec(f"switch_tab(list_tabs(False)[[t['url'] for t in list_tabs(False)].index({origin + '/login'!r})])")
+        assert sup.focus_page(origin, accept=bvt._TAB_PROBES["payment"])["ok"]  # the supervisor is left on /checkout
         vault_unlock.set_save_login_prompt_callback(lambda o, site: {"identifier": "new@b.c", "password": "pw-SAVE-5150"})
         vault_unlock.set_unlock_prompt_callback(lambda *a: "")  # an interactive surface installs both; can_prompt_here keys off this one
         raw = bvt.browser_vault_save_login(task_id=TASK)
@@ -125,7 +129,7 @@ def main() -> int:
         assert sup.focus_page(origin, accept=bvt._TAB_PROBES["login"])["ok"]
         dom = sup.evaluate_runtime("location.pathname + ' ' + document.querySelector('input[name=pw]').value")
         assert dom["result"] == "/login pw-SAVE-5150", dom
-        print("save_login: found the login tab from a blank default page, bound to its origin, filled")
+        print("save_login: pinned the tab browser_exec is on (not the supervisor's), bound to its origin, filled")
 
         redact.clear_vault_redaction_values()
         print("E2E OK")

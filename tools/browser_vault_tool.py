@@ -27,8 +27,11 @@ autofill (kernel-login-autofill.ts / fill_from_vault.ts).
 from __future__ import annotations
 
 import json
+import math
+import re
 import secrets
 import logging
+from collections import Counter
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -59,7 +62,9 @@ def _eval_js(task_id: str, expression: str) -> Dict[str, Any]:
     Prefers the supervisor's persistent CDP WebSocket, falls back to the
     agent-browser CLI ``eval`` command. Never use this for expressions that
     embed secret values — the fallback places the expression in subprocess
-    argv. Use :func:`_eval_js_secret` for secret-bearing expressions.
+    argv. Use :func:`_eval_js_secret` for secret-bearing expressions. In
+    Browser Use mode there is no fallback: the agent-browser session is a
+    different browser from the one browser_exec drives.
     """
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY
@@ -76,6 +81,8 @@ def _eval_js(task_id: str, expression: str) -> Dict[str, Any]:
         pass
     except Exception as exc:  # pragma: no cover — defensive
         logger.debug("vault fill: supervisor eval unavailable (%s)", exc)
+    if _browser_use_mode():
+        return {"success": False, "error": "the vault has no supervised connection to the browser_exec session"}
 
     from tools.browser_tool import _last_session_key
     from tools.browser_tool_session import _run_browser_command
@@ -165,26 +172,89 @@ def _parse_json_result(raw: Any) -> Any:
     return raw
 
 
-def _current_page_origin(task_id: str) -> Optional[str]:
+def _browser_use_mode() -> bool:
+    from tools.browser_use_cli import is_browser_use_cli_mode
+
+    return is_browser_use_cli_mode()
+
+
+def _page_origin(task_id: str, where: str = "") -> tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """``(origin, None)`` for the supervised tab, or ``(None, refusal)``. Only http(s) pages have an origin a login
+    can be bound to or filled on: about:blank, chrome://new-tab-page, data:, file: and the like are refused here,
+    before anyone is asked for anything."""
+    from urllib.parse import urlsplit
+
     res = _eval_js(task_id, "window.location.href")
     if not res.get("success"):
-        return None
+        return None, {"success": False, "error": f"Could not read the address of the browser tab{where}: "
+                                                 f"{str(res.get('error') or 'eval failed')[:200]}"}
     href = str(res.get("result") or "").strip().strip('"').strip("'")
-    if not href or href == "about:blank":
-        return None
+    scheme = urlsplit(href).scheme.lower()
+    if scheme not in ("http", "https"):
+        shown = href.split("?", 1)[0].split(",", 1)[0][:60] or "an empty page"
+        return None, {"success": False, "error_type": "not_a_website",
+                      "error": (f"Refused: the browser tab{where} is on {shown}, not a website (http/https). Open the "
+                                "site's login page in that tab first. Nothing was asked, saved or filled.")}
     try:
         from agent.vault_store import normalize_origin
 
-        return normalize_origin(href)
+        return normalize_origin(href), None
     except Exception:
-        return None
+        return None, {"success": False, "error": f"Could not read an origin from the browser tab{where}."}
 
 
-# Per kind: a JS probe that is truthy on a tab holding the form this kind fills.
+def _pin_exec_tab(task_id: str, session: str) -> tuple[str, Optional[Dict[str, Any]]]:
+    """Browser Use mode: point the supervisor at the exact tab browser_exec's daemon is on in ``session`` (empty =
+    the session this task drove last, else the default one). Returns ``(where, None)`` with ``where`` naming the
+    session for messages, or ``("", refusal)``. The supervisor is keyed by task, and a browser_exec in another session
+    re-points it, so every vault call pins again rather than trusting where it was left."""
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+    from tools.browser_use_cli import _SESSION_RE, exec_current_tab, last_exec_session
+
+    name = session.strip() if session else (last_exec_session(task_id) or "")
+    if name and not _SESSION_RE.match(name):
+        return "", {"success": False, "error": f"Invalid session name {name!r}: use the name browser_exec was given."}
+    where = f" in browser session {name!r}" if name else " in the default browser session"
+    tab, err = exec_current_tab(name, task_id)
+    if tab is None:
+        return "", {"success": False, "error_type": "no_browser_session",
+                    "error": f"Could not find the tab{where}: {err}"}
+    supervisor = SUPERVISOR_REGISTRY.get(task_id)
+    if supervisor is None:
+        return "", {"success": False, "error_type": "supervisor_required",
+                    "error": (f"The browser{where} has no CDP endpoint Hermes can attach to (Browser Use cloud), so "
+                              "the vault cannot fill it without putting the secret in process arguments.")}
+    focused = supervisor.focus_target(tab["targetId"])
+    if not focused.get("ok"):
+        return "", {"success": False, "error": f"Could not attach to the tab{where}: {focused.get('error')}"}
+    return where, None
+
+
+def _locate_page(task_id: str, session: str, kind: str) -> tuple[str, Optional[str], Optional[Dict[str, Any]]]:
+    """``(where, origin, refusal)`` for the page a ``kind`` vault call acts on. Browser Use mode: the exact tab
+    browser_exec is on in the session. Built-in tools: the open tab holding a ``kind`` form, else the current one."""
+    if _browser_use_mode():
+        where, refusal = _pin_exec_tab(task_id, session)
+        if refusal:
+            return "", None, refusal
+    else:
+        where = ""
+        _focus_bound_origin(task_id, "", kind)
+    origin, refusal = _page_origin(task_id, where)
+    return where, origin, refusal
+
+
+# Per kind: a JS probe that is truthy on a tab holding the form this kind fills (open shadow roots included).
+def _tab_probe(selector: str) -> str:
+    from agent.vault_login_classifier import build_probe_js
+
+    return build_probe_js(selector)
+
+
 _TAB_PROBES = {
-    "login": "!!document.querySelector('input[type=password]')",
-    "payment": "!!document.querySelector('input[autocomplete^=cc-], [name*=card i], [placeholder*=card i], [name*=cvc i], [name*=cvv i]')",
-    "address": "!!document.querySelector('input[autocomplete^=address-], [autocomplete=postal-code], [name*=address i], [name*=zip i], [name*=postal i]')",
+    "login": _tab_probe("input[type=password]"),
+    "payment": _tab_probe("input[autocomplete^=cc-], [name*=card i], [placeholder*=card i], [name*=cvc i], [name*=cvv i]"),
+    "address": _tab_probe("input[autocomplete^=address-], [autocomplete=postal-code], [name*=address i], [name*=zip i], [name*=postal i]"),
 }
 
 
@@ -200,6 +270,40 @@ def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[str]:
         return None
     focused = supervisor.focus_page(origin, accept=_TAB_PROBES.get(kind))
     return (origin or focused.get("url")) if focused.get("ok") else None
+
+
+# ---------------------------------------------------------------------------
+# Identifiers that read like passwords
+# ---------------------------------------------------------------------------
+
+_EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+_PHONE_RE = re.compile(r"\+?[\d\s().-]{7,20}")
+IDENTIFIER_HIDDEN = "(hidden: it looks like a password)"
+
+
+def identifier_looks_like_password(identifier: str, password: str = "") -> bool:
+    """True when what the user gave as a username reads like a password, so it must never be echoed to the model.
+
+    A user who types their password into the username field (the 11-02 Buzz card mix-up) would otherwise see it
+    returned as agent-visible metadata. Emails and phone numbers pass; anything matching the password, carrying
+    characters usernames don't (spaces, !#$%&*…), mixing lower, upper and digits at password length, or long and
+    near-random is hidden.
+    Errs towards hiding: a hidden username costs the agent one question, a shown password costs the account."""
+    ident = (identifier or "").strip()
+    if not ident:
+        return False
+    if password and (ident == password or (len(ident) >= 6 and (ident in password or password in ident))):
+        return True
+    if _EMAIL_RE.fullmatch(ident) or _PHONE_RE.fullmatch(ident):
+        return False
+    if re.search(r"[^\w.@+-]", ident):
+        return True
+    classes = sum(bool(re.search(p, ident)) for p in (r"[a-z]", r"[A-Z]", r"\d"))
+    if len(ident) >= 8 and classes == 3:
+        return True
+    # Long, mixed and near-random (k3j9x0q2m8w1): generated passwords look like this, chosen usernames rarely do.
+    bits_per_char = -sum(n / len(ident) * math.log2(n / len(ident)) for n in Counter(ident).values())
+    return len(ident) >= 12 and classes >= 2 and bits_per_char >= 3.5
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +337,9 @@ def browser_vault_list() -> str:
                 entry["allowed_origins"] = list(meta.allowed_origins)
             if meta.has_otp or backend.needs_unlock:
                 entry["two_factor"] = "automatic" if meta.has_otp else "automatic if the manager stores a TOTP seed, else the user is asked"
-            if meta.identifier:
+            if meta.identifier and identifier_looks_like_password(meta.identifier):
+                entry["identifier"], entry["identifier_masked"] = IDENTIFIER_HIDDEN, True
+            elif meta.identifier:
                 entry["identifier"] = meta.identifier
                 entry["identifier_type"] = meta.identifier_type
             items.append(entry)
@@ -277,19 +383,19 @@ def browser_vault_unlock(backend_name: str) -> str:
     return json.dumps({"success": True, "backend": backend.name})
 
 
-def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> str:
+def browser_vault_save_login(label: str = "", task_id: Optional[str] = None, session: str = "") -> str:
     """Ask the user (masked prompt on their surface) for the login of the CURRENT page, store it in the local
     vault bound to that origin, and fill the password at once. The values never enter the conversation."""
     from agent.vault_backends.unlock import can_prompt_here, get_save_login_prompt_callback
     from agent.vault_store import get_vault_store
 
     effective_task_id = task_id or "default"
-    # The supervisor's default page session is whatever tab it attached to first (on Browser Use that is
-    # the daemon's blank tab); the login form lives in the tab with a password field, so focus that one.
-    _focus_bound_origin(effective_task_id, "", "login")
-    origin = _current_page_origin(effective_task_id)
-    if not origin:
-        return json.dumps({"success": False, "error": "Open the site's login page first; the login is saved for that page's origin."})
+    if _browser_use_mode():  # the save and its fill act in ONE session, even if another runs in between
+        from tools.browser_use_cli import last_exec_session
+        session = session.strip() or last_exec_session(effective_task_id) or ""
+    _, origin, refusal = _locate_page(effective_task_id, session, "login")
+    if refusal:
+        return json.dumps(refusal)
     prompt = get_save_login_prompt_callback()
     if prompt is None or not can_prompt_here():
         return json.dumps({"success": False, "error_type": "prompt_unavailable",
@@ -302,6 +408,13 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> 
         return json.dumps({"success": False, "error_type": "save_declined",
                            "error": "The user chose not to save a login for this site. Do not ask again this turn."})
     identifier = str(answer["identifier"]).strip()
+    if identifier == str(answer["password"]).strip():
+        answer.clear()
+        return json.dumps({"success": False, "error_type": "identifier_is_password",
+                           "error": ("The username and the password the user entered are the same, so the password "
+                                     "most likely went into the username field. Nothing was saved. Ask them to save it "
+                                     "again with their username or email in the first field; never ask for either in chat.")})
+    masked = identifier_looks_like_password(identifier, str(answer["password"]))
     id_type = "email" if "@" in identifier else ("phone" if identifier.lstrip("+").isdigit() else "username")
     try:
         meta = get_vault_store().add_item("login", site, {"identifier_type": id_type, "identifier": identifier,
@@ -310,18 +423,24 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> 
         return json.dumps({"success": False, "error_type": "save_failed", "error": str(exc)[:200]})
     finally:
         answer.clear()
-    filled = json.loads(browser_vault_fill(meta.id, task_id=effective_task_id))
-    return json.dumps({"success": True, "handle": meta.id, "origin": origin, "identifier": identifier,
-                       "identifier_type": id_type, "fill": filled,
-                       "next": "Type the identifier into the username field if the form has one, then submit."},
-                      ensure_ascii=False)
+    filled = json.loads(browser_vault_fill(meta.id, task_id=effective_task_id, session=session))
+    out = {"success": True, "handle": meta.id, "origin": origin, "identifier": identifier,
+           "identifier_type": id_type, "fill": filled,
+           "next": "Type the identifier into the username field if the form has one, then submit."}
+    if masked:
+        out.update(identifier=IDENTIFIER_HIDDEN, identifier_masked=True, next=(
+            "The username the user entered looks like a password, so it is hidden from you. Do not type it or ask "
+            "for it in chat. Tell the user the saved username may be their password by mistake; they can delete "
+            "the login (Settings → Passwords & Logins or `hermes vault`) and save it again."))
+    del identifier
+    return json.dumps(out, ensure_ascii=False)
 
 
-_TAB_PROBES["otp"] = ("!!document.querySelector('input[autocomplete=one-time-code], input[name*=otp i], input[name*=code i], "
-                      "input[id*=otp i], input[id*=code i], input[name*=totp i], input[aria-label*=code i]')")
+_TAB_PROBES["otp"] = _tab_probe("input[autocomplete=one-time-code], input[name*=otp i], input[name*=code i], "
+                                "input[id*=otp i], input[id*=code i], input[name*=totp i], input[aria-label*=code i]")
 
 
-def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) -> str:
+def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, session: str = "") -> str:
     """Second factor: fill the one-time code the CURRENT page asks for. If the saved login (``handle``) has an
     authenticator seed, the code is minted server-side and nobody is asked; otherwise the user is prompted on
     their surface for the code their phone/email/app shows. The code goes into the page over the supervisor
@@ -332,10 +451,9 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     from agent.vault_login_classifier import LoginControl, build_fill_js, build_inspection_js, build_otp_fills, classify_otp_controls
 
     effective_task_id = task_id or "default"
-    _focus_bound_origin(effective_task_id, "", "otp")
-    origin = _current_page_origin(effective_task_id)
-    if not origin:
-        return json.dumps({"success": False, "error": "No page with a code field is open."})
+    _, origin, refusal = _locate_page(effective_task_id, session, "otp")
+    if refusal:
+        return json.dumps(refusal)
     site = origin.split("://", 1)[-1]
 
     nonce = secrets.token_hex(8)
@@ -386,7 +504,7 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
                        "next": "Submit the form (many sites auto-submit when the last digit lands)."})
 
 
-def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
+def browser_vault_fill(handle: str, task_id: Optional[str] = None, session: str = "") -> str:
     """Fill the current page's password field from a vault handle.
 
     Password-only: the identifier is agent-visible metadata (see
@@ -444,23 +562,22 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     # every saved origin is a valid fill target. Matching stays exact-origin —
     # nothing wildcard/parent-domain is ever inferred.
     allowed = list(meta.allowed_origins) or ([str(meta.origin)] if meta.origin else [])
-    page_origin = None
-    for candidate in allowed:
-        page_origin = _focus_bound_origin(effective_task_id, candidate, meta.kind)
-        if page_origin:
-            break
-    page_origin = page_origin or _current_page_origin(effective_task_id)
-    if not page_origin:
-        return json.dumps(
-            {"success": False, "error": "Could not determine the current page origin. Navigate to the login page first."}
-        )
+    if _browser_use_mode():  # the exact tab browser_exec is on; never another tab that happens to match
+        where, page_origin, refusal = _locate_page(effective_task_id, session, meta.kind)
+    else:
+        page_origin = next(filter(None, (_focus_bound_origin(effective_task_id, c, meta.kind) for c in allowed)), None)
+        where, refusal = "", None
+        if not page_origin:
+            page_origin, refusal = _page_origin(effective_task_id)
+    if refusal:
+        return json.dumps(refusal)
     if page_origin not in allowed:
         return json.dumps(
             {
                 "success": False,
                 "error_type": "origin_mismatch",
                 "error": (
-                    f"Refused: current page origin ({page_origin}) does not match "
+                    f"Refused: the page origin{where} ({page_origin}) does not match "
                     f"the vault item's bound origin(s) ({', '.join(allowed)}). Vault fills "
                     "only run on the exact origin(s) the credential was saved for."
                 ),
@@ -616,7 +733,7 @@ BROWSER_VAULT_FILL_SCHEMA = {
         "fills the address fields. Values are resolved server-side and never appear in the conversation. "
         "Refused unless the page origin exactly matches the item's bound origin (re-checked atomically at "
         "fill time). If a password manager is locked the user is prompted to unlock first. Never retry a "
-        "payment_declined result."
+        "payment_declined result. not_a_website means the tab is on a blank/new-tab/data: page, not the site."
     ),
     "parameters": {
         "type": "object",
@@ -634,7 +751,8 @@ BROWSER_VAULT_FILL_SCHEMA = {
 BROWSER_VAULT_SAVE_LOGIN_SCHEMA = {
     "name": "browser_vault_save_login",
     "description": (
-        "The current page is a login form and browser_vault_list has no item for its origin: ask the user, "
+        "The current page is a site's login form (http/https; blank, new-tab and data: pages are refused as "
+        "not_a_website) and browser_vault_list has no item for its origin: ask the user, "
         "through a masked prompt in their UI, to save the login for this site. Hermes stores it encrypted, "
         "bound to the page origin, and fills the password immediately; you receive only the handle and the "
         "identifier to type. This is the ONLY way a password may reach a page: never type one yourself, never "
@@ -668,12 +786,32 @@ BROWSER_VAULT_ENTER_CODE_SCHEMA = {
 }
 
 
+_SESSION_PROPERTY = {
+    "type": "string",
+    "description": ("The named browser session the page is open in: pass the same `session` name the page was opened "
+                    "and driven with. Omit to use the session this conversation drove last (the default session if none)."),
+}
+
+
+def _session_schema_overrides(schema: Dict[str, Any]):
+    """Browser Use mode: the page lives in a named browser session, so the tool takes ``session``. The built-in
+    browser tools have no sessions, and their schema carries no extra surface."""
+    def overrides() -> Optional[Dict[str, Any]]:
+        if not _browser_use_mode():
+            return None
+        params = schema["parameters"]
+        return {"parameters": {**params, "properties": {**params["properties"], "session": _SESSION_PROPERTY}}}
+    return overrides
+
+
 def _handle_vault_enter_code(args: Dict[str, Any], **kwargs) -> str:
-    return browser_vault_enter_code(handle=str(args.get("handle") or ""), task_id=kwargs.get("task_id"))
+    return browser_vault_enter_code(handle=str(args.get("handle") or ""), task_id=kwargs.get("task_id"),
+                                    session=str(args.get("session") or ""))
 
 
 def _handle_vault_save_login(args: Dict[str, Any], **kwargs) -> str:
-    return browser_vault_save_login(label=str(args.get("label") or ""), task_id=kwargs.get("task_id"))
+    return browser_vault_save_login(label=str(args.get("label") or ""), task_id=kwargs.get("task_id"),
+                                    session=str(args.get("session") or ""))
 
 
 def _handle_vault_list(args: Dict[str, Any], **kwargs) -> str:
@@ -686,7 +824,7 @@ def _handle_vault_unlock(args: Dict[str, Any], **kwargs) -> str:
 
 def _handle_vault_fill(args: Dict[str, Any], **kwargs) -> str:
     return browser_vault_fill(
-        handle=str(args.get("handle") or ""), task_id=kwargs.get("task_id")
+        handle=str(args.get("handle") or ""), task_id=kwargs.get("task_id"), session=str(args.get("session") or "")
     )
 
 
@@ -716,6 +854,7 @@ registry.register(
     name="browser_vault_save_login",
     toolset="browser",
     schema=BROWSER_VAULT_SAVE_LOGIN_SCHEMA,
+    dynamic_schema_overrides=_session_schema_overrides(BROWSER_VAULT_SAVE_LOGIN_SCHEMA),
     handler=_handle_vault_save_login,
     check_fn=_check_vault_available,
     emoji="🔐",
@@ -725,6 +864,7 @@ registry.register(
     name="browser_vault_enter_code",
     toolset="browser",
     schema=BROWSER_VAULT_ENTER_CODE_SCHEMA,
+    dynamic_schema_overrides=_session_schema_overrides(BROWSER_VAULT_ENTER_CODE_SCHEMA),
     handler=_handle_vault_enter_code,
     check_fn=_check_vault_available,
     emoji="🔐",
@@ -734,6 +874,7 @@ registry.register(
     name="browser_vault_fill",
     toolset="browser",
     schema=BROWSER_VAULT_FILL_SCHEMA,
+    dynamic_schema_overrides=_session_schema_overrides(BROWSER_VAULT_FILL_SCHEMA),
     handler=_handle_vault_fill,
     check_fn=_check_vault_available,
     emoji="🔐",
