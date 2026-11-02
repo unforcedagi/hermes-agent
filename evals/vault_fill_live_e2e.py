@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 HOME = Path(tempfile.mkdtemp(prefix="hermes-vault-e2e-"))
 os.environ["HERMES_HOME"] = str(HOME)
+os.environ["BH_HOME"] = str(HOME / "bh")  # own harness daemons: never a live Hermes's "default"
 
 PAGES = {
     "/login": b"""<!doctype html><title>login</title>

@@ -14,6 +14,7 @@ import re
 import shutil
 import signal
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -598,6 +599,41 @@ def exec_current_tab(session: str, task_id: Optional[str]) -> Tuple[Optional[Dic
     return None, redact_sensitive_text((ran[0].stderr or "").strip()[-300:], force=True) or "the browser session reported no current tab"
 
 
+# Harness daemon (its home/dirs + BU_NAME) -> the CDP endpoint this process last started it against. The harness
+# reads BU_CDP_* once, at spawn, and reuses ANY live daemon of the same name: every task's default session is
+# BU_NAME "default", but each task gets its own browser. Without this, task B's code ran in task A's browser while
+# B's vault supervisor sat on B's own blank tab (11-02: page_info on the login page, the vault on
+# chrome://new-tab-page). Another process (CLI, worker) using the same name is the same case.
+_daemon_endpoints: Dict[Tuple[str, ...], str] = {}
+_daemon_endpoints_lock = threading.Lock()
+_DAEMON_ENV_KEYS = ("BH_HOME", "BROWSER_HARNESS_HOME", "XDG_CONFIG_HOME", "HOME", "BH_RUNTIME_DIR", "BH_TMP_DIR")
+
+
+def _bind_daemon(cmd: List[str], env: dict) -> Optional[str]:
+    """Make the harness daemon this call will use one started against ``env``'s CDP endpoint: when this process
+    has not bound that daemon to it yet, stop it (``browser-use --reload``, scoped by BU_NAME) so the call spawns a
+    fresh one. A daemon bound elsewhere loses its current tab on the switch; driving the wrong browser is worse.
+    Error string when the stop fails."""
+    cdp = env.get("BU_CDP_WS") or env.get("BU_CDP_URL") or ""
+    if not cdp:  # BU direct cloud: the daemon owns its own browser
+        return None
+    key = (*(env.get(k, "") for k in _DAEMON_ENV_KEYS), env.get("BU_NAME", "default"))
+    with _daemon_endpoints_lock:
+        if _daemon_endpoints.get(key) == cdp:
+            return None
+    try:
+        proc = subprocess.run(cmd + ["--reload"], env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=60, **_group_popen_kwargs())
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"Could not restart the browser session's driver for its browser: {e}"
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip()[-300:]
+        return f"Could not restart the browser session's driver for its browser: {tail or proc.returncode}"
+    with _daemon_endpoints_lock:
+        _daemon_endpoints[key] = cdp
+    return None
+
+
 def _attach_vault_supervisor(env: dict, task_id: Optional[str]) -> None:
     """Attach the per-task CDP supervisor to the browser this exec drives so ``browser_vault_fill`` has
     a secret-capable WebSocket (never argv) into the SAME browser. Only CDP-routed backends expose an
@@ -728,6 +764,9 @@ def _run_exec(code: str, session: str, timeout_s: Any, task_id: Optional[str],
     workspace = _workspace_dir(task_id)
     if workspace:
         env["BH_AGENT_WORKSPACE"] = workspace
+    bind_err = _bind_daemon(cmd, env)
+    if bind_err:
+        return bind_err
 
     # BU_AUTOSPAWN makes the CLI start a Browser Use cloud browser when no local
     # Chrome/CDP endpoint is reachable (their API key authenticates it)

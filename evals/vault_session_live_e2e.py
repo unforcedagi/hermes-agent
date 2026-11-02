@@ -27,6 +27,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 HOME = Path(tempfile.mkdtemp(prefix="hermes-vault-session-e2e-"))
 os.environ["HERMES_HOME"] = str(HOME)
+# Harness daemons are named per user (BU_NAME), not per HERMES_HOME: give this run its own, so it can never
+# reuse (or restart) a live Hermes's "default" or "kajabi" daemon.
+os.environ["BH_HOME"] = str(HOME / "bh")
 
 PAGES = {
     # The path from the bug report.
@@ -166,6 +169,18 @@ def main() -> int:
         out = call("browser_vault_save_login", {})
         check("save_login() with no session uses the session browser_exec last drove (default) and its tab",
               out.get("origin") == origin and asked == [origin],
+              json.dumps({k: out.get(k) for k in ("success", "origin", "error_type", "error")})[:200])
+
+        # Another conversation (task) drives ITS default session, on its own browser, in between (11-02: two rooms).
+        from tools import browser_use_cli as bu
+        bu.browser_exec(f"new_tab(); cdp('Security.setIgnoreCertificateErrors', ignore=True); goto_url({decoy + '/login'!r}); "
+                        "wait_for_load()", task_id="another-conversation", timeout_s=90)
+        mine = _exec("print(page_info()['url'])")["output"].strip()
+        check("this conversation's default session still drives its own browser, not the other conversation's",
+              mine.startswith(origin + "/identifier"), mine)
+        asked.clear()
+        out = call("browser_vault_save_login", {})
+        check("…and the vault acts on that same tab", out.get("origin") == origin and asked == [origin],
               json.dumps({k: out.get(k) for k in ("success", "origin", "error_type", "error")})[:200])
 
         # Non-website tabs are refused before anyone is asked (one more browser, three pages in turn).

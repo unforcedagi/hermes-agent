@@ -1570,3 +1570,30 @@ class TestScreenshotFrontPreamble:
         assert ns["capture_screenshot"]() == "ok"
         err = capsys.readouterr().err
         assert "bringToFront" in err and "no target" in err
+
+
+@pytest.mark.linux_only
+def test_harness_daemon_is_restarted_when_its_name_is_routed_to_another_browser(tmp_path, monkeypatch):
+    """T-335: every task's default session is BU_NAME "default", but each task has its own browser, and the
+    harness reuses any live daemon of a name. A daemon started for one browser must be stopped (--reload) before
+    a call routed to another browser uses that name; the same name on the same browser is left alone."""
+    import tools.browser_use_cli as bu
+
+    log = tmp_path / "calls.log"
+    fake = tmp_path / "browser-use"
+    fake.write_text(f"#!/bin/sh\necho \"$BU_NAME|$BU_CDP_WS|$*\" >> {log}\n")
+    fake.chmod(0o755)
+    monkeypatch.setattr(bu, "_daemon_endpoints", {})
+
+    def bind(name, cdp):
+        env = {"PATH": os.environ.get("PATH", ""), "BU_CDP_WS": cdp, **({"BU_NAME": name} if name else {})}
+        assert bu._bind_daemon([str(fake)], env) is None
+
+    bind("", "ws://a")      # first use in this process: whatever runs under "default" may be another browser's
+    bind("", "ws://a")      # same browser: keep the daemon (and its current tab)
+    bind("", "ws://b")      # another task's browser under the same name: restart
+    bind("kajabi", "ws://b")  # another name is another daemon
+    bind("", "ws://b")
+    assert log.read_text().splitlines() == ["|ws://a|--reload", "|ws://b|--reload", "kajabi|ws://b|--reload"]
+    assert bu._bind_daemon([str(fake)], {"PATH": os.environ.get("PATH", "")}) is None  # no CDP (BU cloud): untouched
+    assert len(log.read_text().splitlines()) == 3
