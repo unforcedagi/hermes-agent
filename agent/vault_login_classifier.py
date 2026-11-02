@@ -73,6 +73,7 @@ class LoginControl:
     name: str
     type: str
     max_length: Optional[int] = None
+    hidden: bool = False  # not rendered (type=hidden, display:none); reported only by a set-password inspection
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "LoginControl":
@@ -86,6 +87,7 @@ class LoginControl:
             name=str(raw.get("name") or ""),
             type=str(raw.get("type") or ""),
             max_length=int(max_length) if max_length is not None else None,
+            hidden=bool(raw.get("hidden")),
         )
 
 
@@ -179,6 +181,48 @@ def select_password_fill(
     ]
 
 
+_RE_NEW_PASSWORD = re.compile(r"\b(?:new|create|choose|set|confirm|repeat|retype|re\s*enter|verify)\s*(?:a\s*|your\s*)?"
+                              r"(?:new\s*)?password\b|\bpassword\s*(?:again|confirm|confirmation|repeat)\b")
+_RE_CONFIRM_PASSWORD = re.compile(r"\bpassword\s*(?:confirm|confirmation|again|repeat)\b|"
+                                  r"\b(?:confirm|repeat|retype|verify)\w*\s*(?:your\s*)?(?:new\s*)?password\b")
+_RE_CURRENT_PASSWORD = re.compile(r"\b(?:current|old|existing|present)\s*password\b")
+
+
+def classify_new_password_controls(controls: List[LoginControl]) -> List[ClassifiedLoginControl]:
+    """The fields a set-password page (sign-up, invite, reset) wants the NEW password in; ``[]`` on a sign-in page.
+
+    A password box is "new" when its autocomplete says ``new-password`` or its name/label says new/create/confirm/
+    repeat password; a plain password box joins them when its form also has such a box or a confirmation. A current
+    password box (``current-password``, "current/old password") is never a target, so a change-password page keeps
+    the current one for browser_vault_fill. ``token`` is ``new-password`` for visible boxes and ``new-password-sync``
+    for a confirmation the page keeps in an unrendered input (Kajabi's ``type=hidden user[password_confirmation]``,
+    which its <pds-input> is meant to sync). A form without a visible new box yields nothing: a sign-in page has no
+    target. Controls inside a shadow root have no form (form association stops at the shadow boundary), so a
+    form-less control groups with every form."""
+    def text(c: LoginControl) -> str:
+        return _normalize_text(" ".join(p for p in (c.name, c.label) if p))
+
+    def same_group(a: LoginControl, b: LoginControl) -> bool:
+        return a.form_index is None or b.form_index is None or a.form_index == b.form_index
+
+    new, plain, sync = [], [], []
+    for c in controls:
+        tokens = c.autocomplete.lower().split()
+        if c.hidden:
+            if c.type in ("hidden", "password") and _RE_CONFIRM_PASSWORD.search(text(c)):
+                sync.append(c)
+            continue
+        if c.type != "password" or "one-time-code" in tokens:
+            continue
+        if "current-password" in tokens or _RE_CURRENT_PASSWORD.search(text(c)):
+            continue
+        (new if "new-password" in tokens or _RE_NEW_PASSWORD.search(text(c)) else plain).append(c)
+    visible = new + [p for p in plain if any(same_group(p, o) for o in new + sync)]
+    hidden = [s for s in sync if any(same_group(s, v) for v in visible)]
+    return sorted([ClassifiedLoginControl(c, 100, "new-password") for c in visible], key=lambda t: t.control.index) + \
+        sorted([ClassifiedLoginControl(c, 100, "new-password-sync") for c in hidden], key=lambda t: t.control.index)
+
+
 def classify_checkout_control(control: LoginControl) -> Optional[ClassifiedLoginControl]:
     """Classify one control as a payment/address fill target (autocomplete token exact match 100,
     label/name heuristic 70), or None. Password/email inputs are never checkout targets."""
@@ -241,8 +285,11 @@ def build_otp_fills(otp_controls: List[ClassifiedLoginControl], code: str) -> Li
     return [{"index": best.control.index, "token": "one-time-code", "value": code}]
 
 
-def build_inspection_js(nonce: str) -> str:
-    return _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE.replace("__NONCE__", json.dumps(nonce))
+def build_inspection_js(nonce: str, include_hidden: bool = False) -> str:
+    """``include_hidden``: also report unrendered inputs (``hidden: true``), so a set-password fill can reach the
+    confirmation a web component keeps in a ``type=hidden`` input. Login and checkout fills never target them."""
+    return (_LOGIN_CONTROL_INSPECTION_JS_TEMPLATE.replace("__NONCE__", json.dumps(nonce))
+            .replace("__INCLUDE_HIDDEN__", "true" if include_hidden else "false"))
 
 
 # Every element matching ``sel`` in the document AND in every open shadow root, in tree order (a shadow root's
@@ -265,15 +312,18 @@ def build_probe_js(selector: str) -> str:
 
 _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
   const nonce = __NONCE__;
+  const includeHidden = __INCLUDE_HIDDEN__;
   __DEEP_QUERY__
   const elements = deepAll("input, select");
   const forms = Array.from(document.forms);
   elements.forEach((element, index) => element.setAttribute("data-hermes-vault-slot", nonce + ":" + index));
   const out = elements.flatMap((element, index) => {
     if (element.disabled || element.readOnly) return [];
-    if (["hidden", "submit", "button", "reset", "file", "image", "checkbox", "radio"].includes(element.type)) return [];
+    if (["submit", "button", "reset", "file", "image", "checkbox", "radio"].includes(element.type)) return [];
     const style = getComputedStyle(element);
-    if (style.display === "none" || style.visibility === "hidden" || element.getClientRects().length === 0) return [];
+    const hidden = element.type === "hidden" || style.display === "none" || style.visibility === "hidden"
+      || element.getClientRects().length === 0;
+    if (hidden && !includeHidden) return [];
     const labels = element.labels ? Array.from(element.labels, (l) => l.textContent || "") : [];
     const root = element.getRootNode();
     const ariaText = (element.getAttribute("aria-labelledby") || "")
@@ -299,6 +349,7 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
       ].join(" "),
       name: [element.name, element.id].join(" "),
       type: element.tagName === "SELECT" ? "select" : (element.type || ""),
+      ...(hidden ? { hidden: true } : {}),
     }];
   });
   return JSON.stringify(out);
@@ -315,7 +366,8 @@ def build_fill_js(fills: List[Dict[str, Any]], expected_origin: str, nonce: str 
     proof scope equals mutation scope (#88706). Targets resolve by the ``<nonce>:<index>`` stamp of
     THIS inspection, in the document and in open shadow roots alike; values go in through the native value setter
     and ``input``/``change`` fire bubbling AND composed, so a listener outside a web component hears them. A
-    ``current-password`` fill additionally requires ``type=password``; ``<select>``
+    ``current-password`` / ``new-password`` fill additionally requires ``type=password`` (``new-password-sync``:
+    password or hidden), and ``matched`` counts the targets still holding their value after all writes; ``<select>``
     controls (country, state, expiry month) match an option by value or visible text. No marker is
     left on filled controls so later model-driven DOM reads cannot address them deterministically.
     """
@@ -335,11 +387,15 @@ _FILL_JS_TEMPLATE = """(() => {
   const nonce = __NONCE__;
   __DEEP_QUERY__
   const stamped = deepAll("[data-hermes-vault-slot]");
+  // A password only ever goes into a password box; a set-password confirmation may also be an unrendered input.
+  const needsType = {"current-password": ["password"], "new-password": ["password"], "new-password-sync": ["hidden", "password"]};
+  const written = [];
   let filled = 0;
   const norm = (t) => String(t || "").trim().toLowerCase();
   for (const f of fills) {
     const el = stamped.find((n) => n.getAttribute("data-hermes-vault-slot") === nonce + ":" + f.index);
-    if (!el || (f.token === "current-password" && el.type !== "password")) continue;
+    const types = needsType[f.token];
+    if (!el || (types && !types.includes(el.type))) continue;
     try {
       if (el.tagName === "SELECT") {
         const want = norm(f.value);
@@ -354,8 +410,11 @@ _FILL_JS_TEMPLATE = """(() => {
       el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText" }));
       el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
       if (el.value.length > 0) filled += 1;
+      written.push([el, f.value]);
     } catch (e) { /* skip */ }
   }
   stamped.forEach((n) => n.removeAttribute("data-hermes-vault-slot"));
-  return JSON.stringify({ filled });
+  // Read back after every write: a component that re-syncs or clears a field on input shows up here.
+  const matched = written.filter(([el, value]) => el.value === value).length;
+  return JSON.stringify({ filled, matched });
 })()""".replace("__DEEP_QUERY__", _DEEP_QUERY_JS)

@@ -390,6 +390,19 @@ class VaultStore:
             self._write_all(remaining)
             return True
 
+    def set_password(self, item_id: str, password: str) -> VaultItemMeta:
+        """Replace a login's password in place (handle, origin, identifier and any TOTP seed stay)."""
+        if not password:
+            raise VaultError("password is required")
+        with self._locked():
+            items = self._read_all()
+            rec = next((r for r in items if r.get("id") == item_id and r.get("kind") == "login"), None)
+            if rec is None:
+                raise VaultError(f"no login with id {item_id!r}")
+            rec["secret"] = {**(rec.get("secret") or {}), "password": password}
+            self._write_all(items)
+            return self._meta(rec)
+
     def get_meta(self, item_id: str) -> Optional[VaultItemMeta]:
         with self._locked():
             for rec in self._read_all():

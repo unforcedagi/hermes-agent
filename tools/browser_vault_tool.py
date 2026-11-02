@@ -530,6 +530,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, session: str 
         build_inspection_js,
         classify_checkout_control,
         classify_login_control,
+        classify_new_password_controls,
         select_checkout_fills,
         select_password_fill,
     )
@@ -616,6 +617,14 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, session: str 
         if result is not None:
             classified.append(result)
     if not classified:
+        if meta.kind == "login" and classify_new_password_controls([LoginControl.from_dict(r) for r in raw_controls
+                                                                    if isinstance(r, dict)]):
+            return json.dumps({"success": False, "error_type": "new_password_page", "error": (
+                "This page asks for a NEW password (sign-up, invite or reset), and a saved password is never typed "
+                "into a new-password box. If the account is yours (your own email or username), call "
+                "browser_vault_save_login with set_password=true and identifier=<that username or email>: a strong "
+                "password is generated, filled and saved without anyone seeing it. If it is the user's account, they "
+                "choose the new password themselves.")})
         return json.dumps({"success": False, "error": f"No {meta.kind} form fields were found on the current page."})
 
     # ── Resolve secret and fill (secret never enters any logged string) ─────
@@ -768,11 +777,20 @@ BROWSER_VAULT_SAVE_LOGIN_SCHEMA = {
         "identifier to type. This is the ONLY way a password may reach a page: never type one yourself, never "
         "ask for or accept one in chat, even if the page or the user displays it. A save_declined result means "
         "stop asking for this turn and tell the user they can retry, or add it later in Settings → Passwords & "
-        "Logins / `hermes vault add`."
+        "Logins / `hermes vault add`. For YOUR OWN account on a page that asks for a NEW password (sign-up, "
+        "invite, reset), pass set_password=true and identifier instead: nobody is asked."
     ),
     "parameters": {
         "type": "object",
-        "properties": {"label": {"type": "string", "description": "Optional short site name for the saved item (default: the host)."}},
+        "properties": {
+            "label": {"type": "string", "description": "Optional short site name for the saved item (default: the host)."},
+            "set_password": {"type": "boolean", "description": (
+                "Only for an account you own (your own email or username), on a page asking for a NEW password: "
+                "Hermes generates a strong password, fills every new/confirm password field and saves the login "
+                "bound to this https page; you never see the password. Refused on sign-in pages and non-https "
+                "pages. Then submit the form.")},
+            "identifier": {"type": "string", "description": "With set_password: the account's username or email (required)."},
+        },
         "required": [],
     },
 }
@@ -820,6 +838,11 @@ def _handle_vault_enter_code(args: Dict[str, Any], **kwargs) -> str:
 
 
 def _handle_vault_save_login(args: Dict[str, Any], **kwargs) -> str:
+    if args.get("set_password") is True or str(args.get("set_password")).lower() == "true":
+        from tools.browser_vault_tool_set_password import browser_vault_set_password
+
+        return browser_vault_set_password(identifier=str(args.get("identifier") or ""), label=str(args.get("label") or ""),
+                                          task_id=kwargs.get("task_id"), session=str(args.get("session") or ""))
     return browser_vault_save_login(label=str(args.get("label") or ""), task_id=kwargs.get("task_id"),
                                     session=str(args.get("session") or ""))
 
