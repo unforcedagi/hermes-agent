@@ -64,6 +64,21 @@ class TestWhichFieldsTakeTheNewPassword:
     def test_a_lone_confirm_style_box_is_a_re_authentication_prompt(self, label):
         assert _targets([_c(0, "password", "pw", label)]) == []
 
+    def test_a_change_page_whose_current_box_is_labelled_just_password(self):
+        controls = [_c(0, "password", "password", "Password"), _c(1, "password", "new", "New password"),
+                    _c(2, "password", "again", "Confirm new password")]
+        assert _targets(controls) == [(1, "new-password"), (2, "new-password")]
+
+    def test_no_forms_a_sign_in_box_beside_a_sign_up_box(self):
+        controls = [_c(0, "password", "pw", "Password", form=None), _c(1, "password", "new_pw", "Create password", form=None)]
+        assert _targets(controls) == [(1, "new-password")]
+
+    def test_only_autocomplete_on_a_lone_box_is_weak_evidence(self):
+        """Some sign-in pages mark their password box new-password to block autofill."""
+        lone = classify_new_password_controls([_c(0, "email", "email"), _c(1, "password", "pw", autocomplete="new-password")])
+        labelled = classify_new_password_controls([_c(1, "password", "pw", "Create a password", "new-password")])
+        assert [t.score for t in lone] == [80] and [t.score for t in labelled] == [100]
+
     def test_a_hidden_register_tab_does_not_turn_the_sign_in_box_into_a_target(self):
         """No forms on the page (an SPA): the visible sign-in box and an unrendered Register panel's boxes."""
         controls = [_c(0, "email", "email", form=None), _c(1, "password", "password", "Password", form=None),
@@ -112,8 +127,10 @@ class _FakePage:
     def evaluate_runtime(self, expression):
         if expression == "window.location.href":
             return {"ok": True, "result": self.url}
-        if "getComputedStyle" in expression:  # the inspection
-            return {"ok": True, "result": json.dumps(self.controls)}
+        if "getComputedStyle" in expression:  # the inspection; unrendered inputs only when it asks for them
+            wanted = self.controls if "const includeHidden = true" in expression else \
+                [c for c in self.controls if not c.get("hidden")]
+            return {"ok": True, "result": json.dumps(wanted)}
         fills = json.loads(re.search(r"const fills = (\[.*?\]);\n", expression).group(1))
         if self.navigated:
             return {"ok": True, "result": json.dumps({"refused": "origin_changed", "found": "https://evil.test"})}
@@ -121,6 +138,9 @@ class _FakePage:
             raise ConnectionError(f"websocket closed while evaluating {expression[:4000]}")
         self.written = fills
         taken = len(fills) if self.takes is None else self.takes
+        if taken < len(fills) and "if (true && matched !== fills.length)" in expression:  # all_or_nothing
+            self.written = []
+            return {"ok": True, "result": json.dumps({"filled": 0, "matched": taken, "cleared": True})}
         return {"ok": True, "result": json.dumps({"filled": taken, "matched": taken})}
 
 
@@ -170,12 +190,20 @@ def test_a_sign_in_page_is_refused_and_nothing_is_saved(store, page):
     assert "browser_vault_fill" in out["error"] and page.written == [] and store.list_items() == []
 
 
-@pytest.mark.parametrize("identifier", ["", "   ", "Xk9#mP2$vL7q"])
-def test_an_identifier_is_required_and_must_not_read_like_a_password(store, page, identifier):
+@pytest.mark.parametrize("identifier", ["", "   ", "agi @unforced.test"])
+def test_an_identifier_is_required(store, page, identifier):
     out = json.loads(_set_password(identifier=identifier))
-    assert out["success"] is False and out["error_type"] in ("identifier_required", "identifier_is_password"), out
-    assert identifier.strip() not in out["error"] or not identifier.strip()
+    assert out["success"] is False and out["error_type"] in ("identifier_required", "identifier_invalid"), out
     assert page.written == [] and store.list_items() == []
+
+
+def test_the_agents_own_username_is_never_masked(store, page):
+    """The agent chose it, so the echo-hiding heuristic for usernames a person typed does not apply."""
+    from tools import browser_vault_tool
+
+    out = json.loads(_set_password(identifier="UniBot2026"))
+    assert out["success"] is True and out["identifier"] == "UniBot2026", out
+    assert json.loads(browser_vault_tool.browser_vault_list())["items"][0]["identifier"] == "UniBot2026"
 
 
 @pytest.mark.parametrize("url", ["http://app.kajabi.test/password/edit", "about:blank"])
@@ -205,15 +233,36 @@ def test_the_vault_changes_only_when_the_page_took_the_password(store, page, fai
     assert json.loads(raw)["success"] is False and [m.id for m in store.list_items()] == [other.id]
     assert store.resolve_secret(other.id)["password"] == "theirs-88"
     assert "const fills" not in raw and "data-hermes-vault-slot" not in raw  # no part of the fill script (it holds the value)
+    assert page.written == []  # and the page keeps none of it (all-or-nothing fill)
 
 
-def test_a_login_a_person_saved_is_never_replaced(store, page):
-    """save_login / `hermes vault add` items hold a password a person typed and may still use."""
+def test_on_a_page_that_only_might_be_a_new_password_page_a_saved_login_is_kept(store, page):
+    page.controls = [SIGN_IN[0], dict(SIGN_IN[1], autocomplete="new-password", label="")]
+    earlier = store.add_item("login", "kajabi", {"identifier_type": "email", "identifier": "agi@unforced.test",
+                                                 "password": "the-old-one-77"}, origin="https://app.kajabi.test",
+                             generated=True)
+    out = json.loads(_set_password(identifier="agi@unforced.test"))
+    assert out["error_type"] == "not_clearly_a_new_password_page", out
+    assert page.written == [] and store.resolve_secret(earlier.id)["password"] == "the-old-one-77"
+    store.remove_item(earlier.id)
+    assert json.loads(_set_password(identifier="agi@unforced.test"))["success"] is True  # a fresh sign-up is fine
+
+
+def test_a_login_a_person_saved_is_replaced_only_when_they_agree(store, page):
+    """save_login / `hermes vault add` items hold a password a person typed and may still use: the user is asked
+    (one tap, the approval surface the card fill uses); headless sessions and a no keep it."""
     saved = store.add_item("login", "kajabi", {"identifier_type": "email", "identifier": "Agi@Unforced.test",
                                                "password": "typed-by-aaron-1"}, origin="https://app.kajabi.test")
-    out = json.loads(_set_password(identifier="agi@unforced.test"))
-    assert out["error_type"] == "login_saved_by_person" and f"hermes vault rm {saved.id}" in out["error"], out
-    assert page.written == [] and store.resolve_secret(saved.id)["password"] == "typed-by-aaron-1"
+    asked = []
+    with patch("tools.approval_prompt.request_elicitation_consent", lambda *a, **k: asked.append(a) or "decline"):
+        out = json.loads(_set_password(identifier="agi@unforced.test"))
+    assert out["error_type"] == "login_saved_by_person" and "never remove it yourself" in out["error"], out
+    assert len(asked) == 1 and page.written == [] and store.resolve_secret(saved.id)["password"] == "typed-by-aaron-1"
+    with patch("tools.approval_prompt.request_elicitation_consent", lambda *a, **k: "accept"):
+        out = json.loads(_set_password(identifier="agi@unforced.test"))
+    [meta] = store.list_items()
+    assert out["success"] is True and out["handle"] == saved.id and meta.generated, out
+    assert store.resolve_secret(saved.id)["password"] != "typed-by-aaron-1"
 
 
 def test_the_password_fits_the_fields_maxlength(store, page):
@@ -234,7 +283,10 @@ SIGN_UP = [  # what the login classifier alone reads as an email + a current pas
 ]
 
 
-@pytest.mark.parametrize("controls", [KAJABI, SIGN_UP], ids=["kajabi", "sign-up"])
+KAJABI_NO_HINT = [KAJABI[0], KAJABI[1], dict(KAJABI[2], autocomplete="")]  # only the hidden confirmation says so
+
+
+@pytest.mark.parametrize("controls", [KAJABI, KAJABI_NO_HINT, SIGN_UP], ids=["kajabi", "kajabi-no-hint", "sign-up"])
 def test_fill_never_types_a_saved_password_into_a_new_password_box(store, page, controls):
     """The 11-02 dead end (fill answered "No login form fields were found" on Kajabi's reset page), and a sign-up form
     whose plain "Password" box the login classifier alone would have filled with the saved password."""

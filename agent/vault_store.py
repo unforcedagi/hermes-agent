@@ -396,8 +396,9 @@ class VaultStore:
             self._write_all(remaining)
             return True
 
-    def set_password(self, item_id: str, password: str) -> VaultItemMeta:
-        """Replace a generated login's password in place (handle, origin, identifier and any TOTP seed stay)."""
+    def set_password(self, item_id: str, password: str, generated: Optional[bool] = None) -> VaultItemMeta:
+        """Replace a login's password in place (handle, origin, identifier and any TOTP seed stay). ``generated``
+        records whether Hermes made the new password (None: leave the record's provenance as it was)."""
         if not password:
             raise VaultError("password is required")
         with self._locked():
@@ -406,6 +407,9 @@ class VaultStore:
             if rec is None:
                 raise VaultError(f"no login with id {item_id!r}")
             rec["secret"] = {**(rec.get("secret") or {}), "password": password}
+            if generated is not None:
+                rec.pop("generated", None)
+                rec.update({"generated": True} if generated else {})
             self._write_all(items)
             return self._meta(rec)
 

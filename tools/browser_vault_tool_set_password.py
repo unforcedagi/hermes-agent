@@ -30,6 +30,18 @@ def generate_password(length: int = _PASSWORD_LENGTH) -> str:
             return password
 
 
+def _person_agrees(identifier: str, origin: str) -> bool:
+    """One tap on the user's surface (gateway approval card or CLI panel; headless sessions answer no)."""
+    from tools.approval_prompt import request_elicitation_consent
+
+    return request_elicitation_consent(
+        f"Replace the saved password for {identifier} on {origin}",
+        "The agent wants to set a new, generated password for this account on the site's set-password page and save it "
+        "in place of the password saved now. Nobody sees the new password, and the saved one is gone once replaced. "
+        "Approve only if this is the agent's own account.",
+        surface="vault-set-password", title="Replace a saved password?") == "accept"
+
+
 def _refuse(error_type: str, error: str) -> str:
     return json.dumps({"success": False, "error_type": error_type, "error": error})
 
@@ -47,10 +59,9 @@ def browser_vault_set_password(identifier: str, label: str = "", task_id: Option
         return _refuse("identifier_required", (
             "set_password needs `identifier`: the username or email of YOUR account on this site (the one the "
             "password is for). Nothing was generated or saved."))
-    if bvt.identifier_looks_like_password(identifier):
-        return _refuse("identifier_is_password", (
-            "The identifier reads like a password, not a username or email. Pass the account's username or email. "
-            "Nothing was generated or saved."))
+    if len(identifier) > 254 or any(ch.isspace() for ch in identifier):
+        return _refuse("identifier_invalid", ("`identifier` must be the account's username or email (no spaces). "
+                                              "Nothing was generated or saved."))
     effective_task_id = task_id or "default"
     if bvt._browser_use_mode():  # the inspection and the fill act in ONE session, even if another runs in between
         from tools.browser_use_cli import last_exec_session
@@ -80,12 +91,18 @@ def browser_vault_set_password(identifier: str, label: str = "", task_id: Option
     store = get_vault_store()
     existing = next((m for m in store.list_items() if m.kind == "login" and m.origin == origin
                      and (m.identifier or "").casefold() == identifier.casefold()), None)
-    if existing is not None and not existing.generated:
-        # A person typed that password (save_login, `hermes vault add`) and may still use it: never replace it here.
+    if existing is not None and all(t.score < 100 for t in targets if t.token == "new-password"):
+        return _refuse("not_clearly_a_new_password_page", (
+            f"The page{where} has one password box marked new-password and nothing else saying so (no label, "
+            "confirmation or current-password box). Some sign-in pages mark their box that way to block autofill, and "
+            f"a login for {identifier} is already saved here ({existing.id}), so set_password will not replace it on "
+            "this page. Nothing was generated or saved."))
+    if existing is not None and not existing.generated and not _person_agrees(identifier, origin):
+        # A person typed that password (save_login, `hermes vault add`) and may still use it.
         return _refuse("login_saved_by_person", (
-            f"A login for {identifier} on {origin} was saved by a person ({existing.id}), so set_password will not "
-            "replace it. If this account is yours and that saved password is no longer wanted, remove it with "
-            f"`hermes vault rm {existing.id}` and call again. Nothing was generated or saved."))
+            f"A login for {identifier} on {origin} was saved by a person ({existing.id}), and they did not agree to "
+            "replace it with a generated password. Ask them in chat whether to replace it, then call again; never "
+            "remove it yourself. Nothing was generated or saved."))
     limits = [t.control.max_length for t in targets if t.token == "new-password" and t.control.max_length]
     length = min([_PASSWORD_LENGTH, *limits])
     if length < _MIN_LENGTH:
@@ -94,11 +111,10 @@ def browser_vault_set_password(identifier: str, label: str = "", task_id: Option
     password = generate_password(length)
     register_vault_redaction_value(password)  # before it touches the page: no later browser result can echo it
     secret = {"password": password}
-    previous = ""
     try:
         if existing is not None:
-            previous = str(store.resolve_secret(existing.id).get("password") or "")
-            meta = store.set_password(existing.id, password)
+            previous = store.resolve_secret(existing.id)
+            meta = store.set_password(existing.id, password, generated=True)
         else:
             meta = store.add_item("login", label.strip() or origin.split("://", 1)[-1],
                                   {"identifier_type": bvt.identifier_type(identifier), "identifier": identifier,
@@ -108,7 +124,8 @@ def browser_vault_set_password(identifier: str, label: str = "", task_id: Option
 
     fills = [{"index": t.control.index, "token": t.token, "value": password} for t in targets]
     try:
-        result = bvt._eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
+        result = bvt._eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce,
+                                                                      all_or_nothing=True))
     except Exception as exc:
         result = {"success": False, "error": str(exc)}
     parsed: Any = bvt._parse_json_result(result.get("result")) if result.get("success") else None
@@ -116,12 +133,17 @@ def browser_vault_set_password(identifier: str, label: str = "", task_id: Option
         parsed = bvt._parse_json_result(parsed)
     landed = isinstance(parsed, dict) and not parsed.get("refused") and parsed.get("matched") == len(fills)
     if not landed:
-        # The vault changes only when the page took the password: undo the save, so a new login is not left behind
-        # and an updated one keeps the password the site still has.
-        if existing is not None:
-            store.set_password(meta.id, previous)
-        else:
-            store.remove_item(meta.id)
+        # The vault changes only when the page took the password (and the page keeps none of it: all_or_nothing).
+        # Undo the save, so a new login is not left behind and an updated one keeps what the site still has.
+        try:
+            if existing is not None:
+                store.set_password(meta.id, str(previous.get("password") or ""), generated=existing.generated)
+            else:
+                store.remove_item(meta.id)
+        except Exception as exc:
+            return _refuse("rollback_failed", (
+                f"The page did not take the password, and the vault could not be put back ({type(exc).__name__}): "
+                f"login {meta.id} may now hold a password the site never got. Tell the user."))
         if isinstance(parsed, dict) and parsed.get("refused") == "origin_changed":
             return _refuse("origin_changed", f"The page left {origin} before the password went in. Nothing was saved.")
         if not result.get("success"):
@@ -130,7 +152,8 @@ def browser_vault_set_password(identifier: str, label: str = "", task_id: Option
                                "error": f"{err} Nothing was saved."})
         took = parsed.get("matched", 0) if isinstance(parsed, dict) else 0
         return _refuse("fill_failed", (f"The page{where} kept the password in {took} of {len(fills)} new-password "
-                                       "fields, so nothing was saved. Reload the page and try again once."))
+                                       "fields, so the fields were emptied again and nothing was saved. Reload the "
+                                       "page and try again once."))
     out: Dict[str, Any] = {
         "success": True, "handle": meta.id, "origin": origin, "identifier": identifier,
         "filled_fields": sum(t.token == "new-password" for t in targets),

@@ -80,6 +80,11 @@ document.addEventListener("change", (e) => { if (e.composedPath()[0].name === "u
 <input type=hidden name=authenticity_token value=tok>
 <pds-input type=password name="user[password]" id=user_password label="New password"></pds-input>
 <input type=hidden name="user[password_confirmation]"><button type=submit>Change my password</button></form>""" + b"__PDS__",
+    # A component that enforces its own 8-character cap on input.
+    "/kajabi/password/edit-truncating": b"""<!doctype html><title>Change your password</title>
+<form method=post action="/kajabi/password">
+<pds-input type=password name="user[password]" autocomplete=new-password sync="user[password_confirmation]" cap=8></pds-input>
+<input type=hidden name="user[password_confirmation]"><button type=submit>Change my password</button></form>""" + b"__PDS__",
     "/kajabi/login": b"""<!doctype html><title>Log in</title><form method=post action="/kajabi/sign_in">
 <input type=email name="user[email]" autocomplete=username>
 <pds-input type=password name="user[password]" id=user_password autocomplete=current-password label="Password"></pds-input>
@@ -100,6 +105,7 @@ customElements.define("pds-input", class extends HTMLElement {
     if (this.getAttribute("autocomplete")) input.autocomplete = this.getAttribute("autocomplete");
     this.attachShadow({mode: "open"}).appendChild(input);
     input.addEventListener("input", () => {
+      if (this.getAttribute("cap")) input.value = input.value.slice(0, +this.getAttribute("cap"));
       this.internals.setFormValue(input.value);
       const sync = this.getAttribute("sync");
       if (sync) this.closest("form").querySelector(`[name="${sync}"]`).value = input.value;
@@ -131,6 +137,7 @@ def _files_holding(root: Path, secrets_: list[str]) -> list[str]:
 
 
 BROWSER_PROFILE: list[Path] = []
+PROMPTED: list[str] = []  # the password the save_login prompt "typed" earlier in the run
 
 
 def _post(path: str, form: dict) -> bytes:
@@ -259,23 +266,37 @@ def _set_password_checks(origin: str, call, seen: list) -> list[str]:
     check("set_password without an identifier is refused", out.get("error_type") == "identifier_required"
           and len(store.list_items()) == before, out.get("error_type") or "")
 
-    # As on 11-02 (vault_d00abad4df28): logins a person saved for this account exist, so set_password will not replace
-    # them; remove them with the real CLI, as the refusal says, and call again.
+    # As on 11-02 (vault_d00abad4df28): a login a person saved exists for this account. set_password replaces it only
+    # when the user agrees (one tap on the approval surface; faked here as the human's answer only).
+    import tools.approval_prompt as ap
+
+    by_person = next(m.id for m in store.list_items() if m.origin == origin and m.identifier == IDENTIFIER)
+    ap.request_elicitation_consent = lambda *a, **k: "decline"
     out = call("browser_vault_save_login", {"set_password": True, "identifier": IDENTIFIER, "session": "kajabi"})
-    by_person = [m.id for m in store.list_items() if m.origin == origin and m.identifier == IDENTIFIER]
-    check("set_password will not replace a login a person saved, and says how to remove it",
-          out.get("error_type") == "login_saved_by_person" and f"hermes vault rm {by_person[0]}" in (out.get("error") or ""),
+    check("set_password will not replace a login a person saved unless they agree",
+          out.get("error_type") == "login_saved_by_person" and store.resolve_secret(by_person)["password"] == PROMPTED[0],
           out.get("error_type") or json.dumps(out)[:120])
-    for item in by_person:
-        subprocess.run([sys.executable, str(ROOT / "hermes"), "vault", "rm", item], cwd=ROOT, check=True,
-                       capture_output=True, env={**os.environ, "HERMES_HOME": str(HOME)})
+
+    # A component that cuts the box to 8 characters: the page does not keep the password, so nothing is saved and
+    # every field written is emptied again (no half-set password a later submit could send).
+    ap.request_elicitation_consent = lambda *a, **k: "accept"
+    _open(origin + "/kajabi/password/edit-truncating", "kajabi")
+    out = call("browser_vault_save_login", {"set_password": True, "identifier": IDENTIFIER, "session": "kajabi"})
+    left = exec_seen("print(js(\"[document.querySelector('pds-input').shadowRoot.querySelector('input').value.length, "
+                     "document.getElementsByName('user[password_confirmation]')[0].value.length].join('|')\"))")
+    check("when the page does not keep the password, its fields are emptied and the vault is left as it was",
+          out.get("error_type") == "fill_failed" and left == "0|0" and store.get_meta(by_person).generated is False
+          and store.resolve_secret(by_person)["password"] == PROMPTED[0], f"{out.get('error_type')} · fields {left}")
+
+    _open(origin + "/kajabi/password/edit", "kajabi")
     out = call("browser_vault_save_login", {"set_password": True, "identifier": IDENTIFIER, "session": "kajabi"})
     handle = out.get("handle") or ""
     meta = store.get_meta(handle) if handle else None
     pw = store.resolve_secret(handle)["password"] if meta else ""
     generated += [pw] if pw else []
-    check("set_password on Kajabi's page (shadow box, component syncs the hidden confirmation) saves a login bound to "
-          "the https origin", out.get("success") is True and meta is not None and meta.origin == origin
+    check("set_password on Kajabi's page (shadow box, component syncs the hidden confirmation), once the user agreed, "
+          "replaces that login in place", out.get("success") is True and meta is not None and meta.origin == origin
+          and handle == by_person and meta.generated
           and meta.identifier == IDENTIFIER and out.get("confirmation_synced") is True and out.get("filled_fields") == 1,
           json.dumps({k: out.get(k) for k in ("success", "origin", "filled_fields", "confirmation_synced", "error_type",
                                               "error")})[:220])
@@ -348,6 +369,7 @@ def main() -> int:
     hermes_logging.setup_logging(hermes_home=HOME, log_level="DEBUG", mode="gateway", force=True)
     asked: list[str] = []
     password = f"t335-dummy-{secrets.token_hex(8)}"
+    PROMPTED.append(password)
     generated: list[str] = []
     seen: list[str] = []  # every tool result and every browser_exec output, searched for generated passwords at the end
 

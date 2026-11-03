@@ -340,7 +340,7 @@ def browser_vault_list() -> str:
                 entry["allowed_origins"] = list(meta.allowed_origins)
             if meta.has_otp or backend.needs_unlock:
                 entry["two_factor"] = "automatic" if meta.has_otp else "automatic if the manager stores a TOTP seed, else the user is asked"
-            if meta.identifier and identifier_looks_like_password(meta.identifier):
+            if meta.identifier and not meta.generated and identifier_looks_like_password(meta.identifier):
                 entry["identifier"], entry["identifier_masked"] = IDENTIFIER_HIDDEN, True
             elif meta.identifier:
                 entry["identifier"] = meta.identifier
@@ -602,7 +602,9 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, session: str 
 
     # ── Inspect + classify page controls ────────────────────────────────────
     nonce = secrets.token_hex(8)  # binds this fill to THIS inspection's stamps
-    inspect = _eval_js(effective_task_id, build_inspection_js(nonce))
+    # Logins: unrendered inputs too, for the new-password check only (a type=hidden password confirmation is what
+    # marks Kajabi's reset page); they are never fill targets.
+    inspect = _eval_js(effective_task_id, build_inspection_js(nonce, include_hidden=meta.kind == "login"))
     if not inspect.get("success"):
         return json.dumps(
             {"success": False, "error": f"Could not inspect page inputs: {inspect.get('error', 'eval failed')}"}
@@ -615,19 +617,23 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, session: str 
 
     classify = classify_login_control if meta.kind == "login" else classify_checkout_control
     controls = [LoginControl.from_dict(raw) for raw in raw_controls if isinstance(raw, dict)]
-    classified: list[ClassifiedLoginControl] = [c for c in map(classify, controls) if c is not None]
+    classified: list[ClassifiedLoginControl] = [c for c in map(classify, (c for c in controls if not c.hidden))
+                                                if c is not None]
     if meta.kind == "login":
         # A saved password never goes into a box that asks for a NEW one (a sign-up "Password" + "Confirm" pair
         # reads as current-password to the login classifier). One predicate decides, the one set_password uses.
-        new_boxes = {t.control.index for t in classify_new_password_controls(controls)}
-        classified = [c for c in classified if c.control.index not in new_boxes]
-        if new_boxes and not any(c.token == "current-password" for c in classified):
+        new_targets = [t for t in classify_new_password_controls(controls) if t.token == "new-password"]
+        classified = [c for c in classified if c.control.index not in {t.control.index for t in new_targets}]
+        if new_targets and not any(c.token == "current-password" for c in classified):
+            weak = all(t.score < 100 for t in new_targets)
             return json.dumps({"success": False, "error_type": "new_password_page", "error": (
                 "This page asks for a NEW password (sign-up, invite or reset), and a saved password is never typed "
                 "into a new-password box. If the account is yours (your own email or username), call "
                 "browser_vault_save_login with set_password=true and identifier=<that username or email>: a strong "
                 "password is generated, filled and saved without anyone seeing it. If it is the user's account, they "
-                "choose the new password themselves.")})
+                "choose the new password themselves." + (
+                    " The only sign is the box's autocomplete=new-password: if this is in fact a sign-in page (some "
+                    "sites mark it so to block autofill), the vault cannot fill it; tell the user." if weak else ""))})
     if not classified:
         return json.dumps({"success": False, "error": f"No {meta.kind} form fields were found on the current page."})
 

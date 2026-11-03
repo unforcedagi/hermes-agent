@@ -73,7 +73,7 @@ class LoginControl:
     name: str
     type: str
     max_length: Optional[int] = None
-    hidden: bool = False  # not rendered (type=hidden, display:none); reported only by a set-password inspection
+    hidden: bool = False  # not rendered (type=hidden, display:none); reported only by an include_hidden inspection
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "LoginControl":
@@ -192,41 +192,51 @@ _RE_CURRENT_PASSWORD = re.compile(r"\b(?:current|old|existing|present)\s*passwor
 def classify_new_password_controls(controls: List[LoginControl]) -> List[ClassifiedLoginControl]:
     """The fields a set-password page (sign-up, invite, reset) wants the NEW password in; ``[]`` on a sign-in page.
 
-    Per form (a control inside a web component counts in its host's form): a password box is "new" when its
-    autocomplete says ``new-password`` or its name/label says new/create/choose password. A confirm-style box
-    (confirm/repeat/verify password, password confirmation) and a plain box join only when the form has a second
-    password box that makes it a set-password form: a new one, or a plain + confirm pair. A lone "Verify your password"
-    is a re-authentication prompt, not a target. A confirmation the page keeps in a ``type=hidden`` input (Kajabi's
-    ``user[password_confirmation]``, synced by its <pds-input>) marks its form's plain box as new too, and is filled
-    as ``new-password-sync``; an unrendered password box (a hidden Register tab) is filled with its form but never
-    makes it a set-password form. A current-password box (``current-password``, "current/old password") is never a
-    target, so a change-password page keeps it for browser_vault_fill."""
+    Per form (an input inside a web component counts in its host's form): a password box is "new" when its
+    autocomplete says ``new-password`` or its label says new/create/choose password, and a confirm-style box
+    (confirm/repeat/verify password, password confirmation) joins it. Without a "new" box, a plain box takes the new
+    password only beside a confirm box (a sign-up "Password" + "Confirm" pair) or a ``type=hidden`` confirmation
+    (Kajabi's ``user[password_confirmation]``, synced by its <pds-input>). So a lone "Verify your password" is a
+    re-authentication prompt, and on a change page the current box stays out even when it is labelled just
+    "Password"; a current-password box (``current-password``, "current/old password") is never a target. Unrendered
+    confirmations are filled as ``new-password-sync``, but an unrendered password box (a hidden Register tab) never
+    makes a form a set-password form.
+
+    Score 100, or 80 when the only evidence is ``autocomplete=new-password`` on a lone box with no label, confirmation
+    or current box: some sign-in pages mark their password box that way to block autofill."""
     def text(c: LoginControl) -> str:
         return _normalize_text(" ".join(p for p in (c.name, c.label) if p))
 
     forms: Dict[Optional[int], Dict[str, List[LoginControl]]] = {}
     for c in controls:
         tokens = c.autocomplete.lower().split()
-        if c.type not in ("password", "hidden") or "one-time-code" in tokens or "current-password" in tokens:
+        if c.type not in ("password", "hidden") or "one-time-code" in tokens:
             continue
-        if _RE_CURRENT_PASSWORD.search(text(c)):
-            continue
-        kind = ("new" if "new-password" in tokens or _RE_NEW_PASSWORD.search(text(c))
-                else "confirm" if _RE_CONFIRM_PASSWORD.search(text(c)) else "plain")
-        if c.hidden:
+        if "current-password" in tokens or _RE_CURRENT_PASSWORD.search(text(c)):
+            kind: Optional[str] = "current" if c.type == "password" and not c.hidden else None
+        elif "new-password" in tokens or _RE_NEW_PASSWORD.search(text(c)):
+            kind = "new"
+        else:
+            kind = "confirm" if _RE_CONFIRM_PASSWORD.search(text(c)) else "plain"
+        if kind in ("new", "confirm", "plain") and c.hidden:
             kind = "sync" if kind == "confirm" or (kind == "new" and c.type == "hidden") else None
-        elif c.type != "password":
+        elif kind != "current" and c.type != "password":
             kind = None
         if kind:
             forms.setdefault(c.form_index, {}).setdefault(kind, []).append(c)
     out: List[ClassifiedLoginControl] = []
     for group in forms.values():
-        new, confirm, plain, sync = (group.get(k, []) for k in ("new", "confirm", "plain", "sync"))
-        is_set_form = bool(new) or (plain and confirm) or any(c.type == "hidden" for c in sync)
-        visible = new + confirm + plain if is_set_form else []
-        if not visible:
+        new, confirm, plain, sync, current = (group.get(k, []) for k in ("new", "confirm", "plain", "sync", "current"))
+        hidden_confirmation = any(c.type == "hidden" for c in sync)
+        if new:
+            visible = new + confirm
+        elif plain and (confirm or hidden_confirmation):
+            visible = plain + confirm
+        else:
             continue
-        out += [ClassifiedLoginControl(c, 100, "new-password") for c in sorted(visible, key=lambda c: c.index)]
+        weak = (len(visible) == 1 and not sync and not current
+                and not _RE_NEW_PASSWORD.search(text(visible[0])))  # autocomplete=new-password is all there is
+        out += [ClassifiedLoginControl(c, 80 if weak else 100, "new-password") for c in sorted(visible, key=lambda c: c.index)]
         out += [ClassifiedLoginControl(c, 100, "new-password-sync") for c in sorted(sync, key=lambda c: c.index)]
     return out
 
@@ -294,8 +304,8 @@ def build_otp_fills(otp_controls: List[ClassifiedLoginControl], code: str) -> Li
 
 
 def build_inspection_js(nonce: str, include_hidden: bool = False) -> str:
-    """``include_hidden``: also report unrendered inputs (``hidden: true``), so a set-password fill can reach the
-    confirmation a web component keeps in a ``type=hidden`` input. Login and checkout fills never target them."""
+    """``include_hidden``: also report unrendered inputs (``hidden: true``): the confirmation a web component keeps in
+    a ``type=hidden`` input marks a set-password form, and set_password fills it. Nothing else ever targets them."""
     return (_LOGIN_CONTROL_INSPECTION_JS_TEMPLATE.replace("__NONCE__", json.dumps(nonce))
             .replace("__INCLUDE_HIDDEN__", "true" if include_hidden else "false"))
 
@@ -366,7 +376,7 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
 })()""".replace("__DEEP_QUERY__", _DEEP_QUERY_JS)
 
 
-def build_fill_js(fills: List[Dict[str, Any]], expected_origin: str, nonce: str = "") -> str:
+def build_fill_js(fills: List[Dict[str, Any]], expected_origin: str, nonce: str = "", all_or_nothing: bool = False) -> str:
     """Build a JS expression that fills the selected controls and reports only a count. The
     returned expression never echoes the values back.
 
@@ -377,7 +387,8 @@ def build_fill_js(fills: List[Dict[str, Any]], expected_origin: str, nonce: str 
     THIS inspection, in the document and in open shadow roots alike; values go in through the native value setter
     and ``input``/``change`` fire bubbling AND composed, so a listener outside a web component hears them. A
     ``current-password`` / ``new-password`` fill additionally requires ``type=password`` (``new-password-sync``:
-    password or hidden), and ``matched`` counts the targets still holding their value after all writes; ``<select>``
+    password or hidden), and ``matched`` counts the targets still holding their value after all writes
+    (``all_or_nothing``: unless every target does, each written field is emptied again and ``cleared`` set); ``<select>``
     controls (country, state, expiry month) match an option by value or visible text. No marker is
     left on filled controls so later model-driven DOM reads cannot address them deterministically.
     """
@@ -385,7 +396,8 @@ def build_fill_js(fills: List[Dict[str, Any]], expected_origin: str, nonce: str 
         [{"index": f["index"], "token": f.get("token", "current-password"), "value": f["value"]} for f in fills]
     )
     return (_FILL_JS_TEMPLATE.replace("__EXPECTED_ORIGIN__", json.dumps(expected_origin))
-            .replace("__FILLS__", payload).replace("__NONCE__", json.dumps(nonce)))
+            .replace("__FILLS__", payload).replace("__NONCE__", json.dumps(nonce))
+            .replace("__ALL_OR_NOTHING__", "true" if all_or_nothing else "false"))
 
 
 _FILL_JS_TEMPLATE = """(() => {
@@ -426,5 +438,15 @@ _FILL_JS_TEMPLATE = """(() => {
   stamped.forEach((n) => n.removeAttribute("data-hermes-vault-slot"));
   // Read back after every write: a component that re-syncs or clears a field on input shows up here.
   const matched = written.filter(([el, value]) => el.value === value).length;
+  if (__ALL_OR_NOTHING__ && matched !== fills.length) {
+    // A set-password fill that did not land everywhere leaves no half-written password a later submit could set.
+    for (const [el] of written) {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+      if (setter && setter.set) { setter.set.call(el, ""); } else { el.value = ""; }
+      el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "deleteContent" }));
+      el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+    }
+    return JSON.stringify({ filled: 0, matched, cleared: true });
+  }
   return JSON.stringify({ filled, matched });
 })()""".replace("__DEEP_QUERY__", _DEEP_QUERY_JS)
