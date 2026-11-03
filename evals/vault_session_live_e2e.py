@@ -80,6 +80,13 @@ document.addEventListener("change", (e) => { if (e.composedPath()[0].name === "u
 <input type=hidden name=authenticity_token value=tok>
 <pds-input type=password name="user[password]" id=user_password label="New password"></pds-input>
 <input type=hidden name="user[password_confirmation]"><button type=submit>Change my password</button></form>""" + b"__PDS__",
+    # The password box two components deep (<outer-field> > <pds-input> > input), the confirmation in the light DOM.
+    "/kajabi/password/edit-nested": b"""<!doctype html><title>Change your password</title>
+<form method=post action="/kajabi/password"><outer-field></outer-field>
+<input type=hidden name="user[password_confirmation]"><button type=submit>Change my password</button></form>
+<script>customElements.define("outer-field", class extends HTMLElement { connectedCallback() {
+  this.attachShadow({mode: "open"}).innerHTML = '<pds-input type=password name="user[password]" autocomplete=new-password></pds-input>';
+} });</script>""" + b"__PDS__",
     # A component that enforces its own 8-character cap on input.
     "/kajabi/password/edit-truncating": b"""<!doctype html><title>Change your password</title>
 <form method=post action="/kajabi/password">
@@ -337,6 +344,14 @@ def _set_password_checks(origin: str, call, seen: list) -> list[str]:
               and len(store.list_items()) == count and store.resolve_secret(handle)["password"] == pw2, out.get("error_type") or "")
     finally:
         plain.shutdown()
+
+    _open(origin + "/kajabi/password/edit-nested", "kajabi")
+    out = call("browser_vault_save_login", {"set_password": True, "identifier": IDENTIFIER, "session": "kajabi"})
+    generated += [store.resolve_secret(handle)["password"]] if out.get("success") else []
+    check("a box two web components deep counts in its form, so the light-DOM confirmation is filled with it",
+          out.get("success") is True and out.get("confirmation_synced") is True
+          and _page_value("kajabi", "document.getElementsByName('user[password_confirmation]')[0]", raw=True) == generated[-1],
+          json.dumps({k: out.get(k) for k in ("success", "confirmation_synced", "error_type")}))
 
     # Chromium's own profile (outside the temp home). Chromium writes session state a few seconds after a change, so
     # wait past that. Its session-restore file keeps what the SITE's form received (the POST body, the <pds-input>'s

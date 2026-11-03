@@ -689,7 +689,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, session: str 
         out = {"success": False, "error": err}
         if fill_result.get("error_type"):
             out["error_type"] = fill_result["error_type"]
-        return json.dumps(out)
+        return _unstamp(effective_task_id, out) if fill_result.get("error_type") == "supervisor_required" else json.dumps(out)
 
     parsed = _parse_json_result(fill_result.get("result"))
     if isinstance(parsed, str):

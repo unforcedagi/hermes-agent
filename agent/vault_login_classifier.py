@@ -369,8 +369,12 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
     // Inside a web component the host carries the label/name the page author wrote (<pds-input label="Password">).
     const host = root instanceof ShadowRoot ? root.host : null;
     const hostText = host ? ["label", "aria-label", "placeholder", "name"].map((a) => host.getAttribute(a) || "").join(" ") : "";
-    // Form association stops at a shadow boundary: an input inside a web component counts in its host's form.
-    const form = element.form || (host && host.closest ? host.closest("form") : null);
+    // Form association stops at a shadow boundary: an input inside a web component counts in its host's form
+    // (through nested components too).
+    let form = element.form;
+    for (let h = host; !form && h; h = h.getRootNode() instanceof ShadowRoot ? h.getRootNode().host : null) {
+      form = h.closest ? h.closest("form") : null;
+    }
     const resolvedFormIndex = form ? forms.indexOf(form) : -1;
     return [{
       autocomplete: element.autocomplete || "",
@@ -458,8 +462,8 @@ _FILL_JS_TEMPLATE = """(() => {
   const matched = written.filter(([el, value]) => el.value === value).length;
   if (__ALL_OR_NOTHING__ && matched !== fills.length) {
     // A set-password fill that did not land everywhere leaves no half-written password a later submit could set.
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
     for (const [el] of written) {
-      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
       if (setter && setter.set) { setter.set.call(el, ""); } else { el.value = ""; }
       el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "deleteContent" }));
       el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));

@@ -129,10 +129,11 @@ class _FakePage:
     """One tab as the supervisor sees it: answers the address read, the inspection and the fill. ``takes`` is how
     many targets end up holding the value (None = all of them)."""
 
-    def __init__(self, url, controls, takes=None, navigated=False, raises=False):
+    def __init__(self, url, controls, takes=None, navigated=False, raises=False, drops=False):
         self.url, self.controls, self.takes, self.navigated, self.raises = url, controls, takes, navigated, raises
+        self.drops = drops  # the supervisor's socket goes away after the inspection
         self.written: list[dict] = []
-        self.unstamped = self.reloaded = 0
+        self.unstamped = self.reloaded = self.cleared = 0
 
     def focus_page(self, origin, accept=None):
         return {"ok": True, "url": self.url}
@@ -151,6 +152,11 @@ class _FakePage:
                 [c for c in self.controls if not c.get("hidden")]
             return {"ok": True, "result": json.dumps(wanted)}
         fills = json.loads(re.search(r"const fills = (\[.*?\]);\n", expression).group(1))
+        if fills and not any(f["value"] for f in fills):  # emptying the fields again
+            self.cleared += 1
+            return {"ok": True, "result": json.dumps({"filled": 0, "matched": len(fills)})}
+        if self.drops:
+            return {"ok": False, "error": "supervisor session closed"}
         if self.navigated:
             return {"ok": True, "result": json.dumps({"refused": "origin_changed", "found": "https://evil.test"})}
         if self.raises:
@@ -234,7 +240,7 @@ def test_only_https_pages(store, page, url):
     assert page.written == [] and store.list_items() == []
 
 
-@pytest.mark.parametrize("failure", [{"takes": 1}, {"navigated": True}, {"raises": True}])
+@pytest.mark.parametrize("failure", [{"takes": 1}, {"navigated": True}, {"raises": True}, {"drops": True}])
 def test_the_vault_changes_only_when_the_page_took_the_password(store, page, failure):
     """A new login is not left behind, and an earlier generated one keeps its password, when the fill did not land;
     an error from the browser comes back without the password."""
@@ -254,7 +260,10 @@ def test_the_vault_changes_only_when_the_page_took_the_password(store, page, fai
     assert store.resolve_secret(other.id)["password"] == "theirs-88"
     assert "const fills" not in raw and "data-hermes-vault-slot" not in raw  # no part of the fill script (it holds the value)
     assert page.written == []  # and the page keeps none of it (all-or-nothing fill)
-    assert page.reloaded == (2 if failure.get("raises") else 0)  # the call failed, the script may have run: reload
+    # The call failed and the script may have run: the fields are emptied again from a fresh inspection, never by
+    # reloading (a page reached by POST must not be resubmitted). A dropped supervisor never ran it: stamps come off.
+    assert page.cleared == (2 if failure.get("raises") else 0) and page.reloaded == 0
+    assert page.unstamped == (2 if failure.get("drops") else 0)
 
 
 def test_on_a_page_that_only_might_be_a_new_password_page_a_saved_login_is_kept(store, page):
@@ -340,9 +349,10 @@ def test_a_change_form_gets_the_old_password_in_its_current_box_in_the_same_writ
     assert out["success"] is True and out["current_password_filled"] is True, out
     assert sorted((f["index"], f["value"]) for f in page.written) == [(0, "the-old-one-77"), (1, new), (2, new)]
     store.remove_item(earlier.id)
-    out = json.loads(_set_password(identifier="agi@unforced.test"))  # nothing saved: the current box is the agent's job
-    assert out["current_password_filled"] is False and "CURRENT password" in out["next"], out
-    assert sorted(f["index"] for f in page.written) == [1, 2]
+    page.written = []
+    out = json.loads(_set_password(identifier="agi@unforced.test"))  # no saved current password: cannot complete it
+    assert out["error_type"] == "current_password_not_saved" and "'Current password'" in out["error"], out
+    assert page.written == [] and store.list_items() == []
 
 
 def test_a_login_in_a_password_manager_is_left_alone(store, page, monkeypatch):

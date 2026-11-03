@@ -42,6 +42,23 @@ def _person_agrees(identifier: str, origin: str) -> bool:
         surface="vault-set-password", title="Replace a saved password?") == "accept"
 
 
+def _clear_fields(task_id: str, origin: str) -> bool:
+    """Empty every set-password field on the page (found by a fresh inspection). True when that ran."""
+    from agent.vault_login_classifier import build_fill_js, classify_new_password_controls
+    from tools import browser_vault_tool as bvt
+
+    nonce = secrets.token_hex(8)
+    controls, _ = bvt._inspect_controls(task_id, nonce, include_hidden=True)
+    if controls is None:
+        return False
+    empties = [{"index": t.control.index, "token": t.token, "value": ""} for t in classify_new_password_controls(controls)
+               if t.token != "unclear-password"]
+    try:
+        return bool(bvt._eval_js_secret(task_id, build_fill_js(empties, expected_origin=origin, nonce=nonce)).get("success"))
+    except Exception:
+        return False
+
+
 def _in_password_manager(origin: str, identifier: str) -> str:
     """The display name of an external manager (1Password, Bitwarden) that holds a login for this account, or that
     is locked or unreadable so it cannot be ruled out."""
@@ -143,6 +160,14 @@ def browser_vault_set_password(identifier: str, label: str = "", task_id: Option
             f"A login for {identifier} on {origin} was saved by a person ({existing.id}), and they did not agree to "
             "replace it with a generated password. Ask them in chat whether to replace it, then call again; never "
             "remove it yourself. Nothing was generated or saved."))
+    current = [t for t in targets if t.token == "current-password"]
+    if current and existing is None:
+        named = ", ".join(repr((t.control.label.strip() or t.control.name.strip())[:40]) for t in current)
+        return refuse("current_password_not_saved", (
+            f"This form{where} also asks for the current password ({named}), and none is saved in the Hermes vault for "
+            f"{identifier}, so set_password cannot complete it (and afterwards the vault would hold only the new one). "
+            "Use the site's reset-by-email flow instead. If that box belongs to a separate sign-in form on the same "
+            "page, open the sign-up or reset page on its own. Nothing was generated or saved."))
     limits = [t.control.max_length for t in new_boxes if t.control.max_length]
     length = min([_PASSWORD_LENGTH, *limits])
     if length < _MIN_LENGTH:
@@ -164,14 +189,13 @@ def browser_vault_set_password(identifier: str, label: str = "", task_id: Option
         return refuse("save_failed", scrub_secret_from_text(str(exc), secret)[:200])
 
     # A change form's current box takes the password being replaced, in the same all-or-nothing write: once the vault
-    # holds the new one, nothing else could fill it. Without a saved one it is left for the agent.
+    # holds the new one, nothing else could fill it.
     old_password = str(previous.get("password") or "")
-    current = [t for t in targets if t.token == "current-password"]
     if old_password:
         register_vault_redaction_value(old_password)
     fills = [{"index": t.control.index, "token": t.token, "value": password} for t in targets
-             if t.token != "current-password"]
-    fills += [{"index": t.control.index, "token": t.token, "value": old_password} for t in current if old_password]
+             if t.token in ("new-password", "new-password-sync")]
+    fills += [{"index": t.control.index, "token": t.token, "value": old_password} for t in current]
     try:
         result = bvt._eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce,
                                                                       all_or_nothing=True))
@@ -183,10 +207,12 @@ def browser_vault_set_password(identifier: str, label: str = "", task_id: Option
     landed = isinstance(parsed, dict) and not parsed.get("refused") and parsed.get("matched") == len(fills)
     if not landed:
         # The vault changes only when the page took the password. An all-or-nothing fill that ran leaves no field
-        # holding it; when the call itself failed (the script may have run), reload the page to discard any.
-        reloaded = None
-        if not result.get("success") and result.get("error_type") != "supervisor_required":  # outcome unknown
-            reloaded = bool(bvt._eval_js(effective_task_id, "location.reload(), true").get("success"))
+        # holding it; when the call itself failed (the script may have run), empty the fields again from a fresh
+        # inspection (no navigation: a page reached by POST must not be resubmitted).
+        cleared = None
+        if not result.get("success"):
+            cleared = (_clear_fields(effective_task_id, origin) if result.get("error_type") != "supervisor_required"
+                       else bool(json.loads(bvt._unstamp(effective_task_id, {"ok": True})).get("ok")))
         try:
             if existing is not None:
                 store.set_password(meta.id, old_password, generated=existing.generated)
@@ -201,8 +227,9 @@ def browser_vault_set_password(identifier: str, label: str = "", task_id: Option
         if not result.get("success"):
             err = scrub_secret_from_text(scrub_secret_from_text(str(result.get("error") or "fill failed"), secret),
                                          previous)[:200]
-            then = {None: "", True: " The page was reloaded, so it holds none of it."}.get(
-                reloaded, " The page could not be reloaded: reload it before anything else and do not submit it.")
+            then = {None: "", True: " The page's password fields were emptied again."}.get(
+                cleared, " The page's password fields could not be emptied: reload the page before anything else and "
+                         "do not submit it.")
             return json.dumps({"success": False, "error_type": result.get("error_type") or "fill_failed",
                                "error": f"{err} Nothing was saved.{then}"})
         took = parsed.get("matched", 0) if isinstance(parsed, dict) else 0
@@ -218,10 +245,7 @@ def browser_vault_set_password(identifier: str, label: str = "", task_id: Option
                  "makes a new password and replaces this one, so never call it after the site accepted one."),
     }
     if current:
-        out["current_password_filled"] = bool(old_password)
-        if not old_password:
-            out["next"] = ("This form also asks for the CURRENT password, which is not in the Hermes vault: fill that "
-                           "box first (browser_vault_fill with the login that holds it), then submit. ") + out["next"]
+        out["current_password_filled"] = True
     if weak:
         out["next"] += (" The page's only sign of a new password is autocomplete=new-password: if the submit fails "
                         "as a wrong sign-in, this was a sign-in page; remove this login (it holds nothing the site "
