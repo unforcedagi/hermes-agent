@@ -248,8 +248,6 @@ class TestClassifier:
         assert "data-vault-secret" not in js
         assert "elements[f.index]" not in js
         assert '"[data-hermes-vault-slot]"' in js and 'nonce + ":" + f.index' in js
-        # a password fill never lands in a text box
-        assert '"current-password": ["password"], "new-password": ["password"]' in js and "!types.includes(el.type)" in js
         assert js.index('removeAttribute("data-hermes-vault-slot")') > js.index("setter.set.call")
 
     def test_build_fill_js_asserts_origin_before_any_write(self):

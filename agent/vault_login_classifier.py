@@ -190,54 +190,62 @@ _RE_CURRENT_PASSWORD = re.compile(r"\b(?:current|old|existing|present)\s*passwor
 
 
 def classify_new_password_controls(controls: List[LoginControl]) -> List[ClassifiedLoginControl]:
-    """The fields a set-password page (sign-up, invite, reset) wants the NEW password in; ``[]`` on a sign-in page.
+    """The fields of a set-password page (sign-up, invite, reset): ``[]`` on a sign-in page.
 
-    Per form (an input inside a web component counts in its host's form): a password box is "new" when its
-    autocomplete says ``new-password`` or its label says new/create/choose password, and a confirm-style box
-    (confirm/repeat/verify password, password confirmation) joins it. Without a "new" box, a plain box takes the new
-    password only beside a confirm box (a sign-up "Password" + "Confirm" pair) or a ``type=hidden`` confirmation
-    (Kajabi's ``user[password_confirmation]``, synced by its <pds-input>). So a lone "Verify your password" is a
-    re-authentication prompt, and on a change page the current box stays out even when it is labelled just
-    "Password"; a current-password box (``current-password``, "current/old password") is never a target. Unrendered
-    confirmations are filled as ``new-password-sync``, but an unrendered password box (a hidden Register tab) never
-    makes a form a set-password form.
+    Per form (an input inside a web component counts in its host's form; inputs outside any form share one group): a
+    password box is "new" when its autocomplete says ``new-password`` or its label says new/create/choose password,
+    and confirm-style boxes (confirm/repeat/verify password, password confirmation) join it. Without a "new" box, each
+    confirmation pairs with the nearest plain box: a sign-up "Password" + "Confirm" pair, or Kajabi's box with its
+    ``type=hidden`` ``user[password_confirmation]`` (synced by its <pds-input>). So a lone "Verify your password" is a
+    re-authentication prompt, and a sign-in box beside a sign-up pair stays out. Tokens: ``new-password`` for the
+    boxes taking the new password, ``new-password-sync`` for a hidden confirmation (only ``type=hidden`` inputs named
+    like one; an unrendered password box, e.g. a hidden Register tab, is never filled), and ``current-password`` for
+    the current box of a change form (``current-password``, "current/old password", or a plain box beside a "new"
+    one in the same <form>), which set_password fills only with the saved password it replaces.
 
-    Score 100, or 80 when the only evidence is ``autocomplete=new-password`` on a lone box with no label, confirmation
-    or current box: some sign-in pages mark their password box that way to block autofill."""
+    New-password scores are 100, or 80 when the only evidence is ``autocomplete=new-password`` on a lone box with no
+    label, confirmation or current box: some sign-in pages mark their password box that way to block autofill."""
     def text(c: LoginControl) -> str:
         return _normalize_text(" ".join(p for p in (c.name, c.label) if p))
 
     forms: Dict[Optional[int], Dict[str, List[LoginControl]]] = {}
     for c in controls:
-        tokens = c.autocomplete.lower().split()
-        if c.type not in ("password", "hidden") or "one-time-code" in tokens:
+        tokens, t = c.autocomplete.lower().split(), text(c)
+        if "one-time-code" in tokens:
             continue
-        if "current-password" in tokens or _RE_CURRENT_PASSWORD.search(text(c)):
-            kind: Optional[str] = "current" if c.type == "password" and not c.hidden else None
-        elif "new-password" in tokens or _RE_NEW_PASSWORD.search(text(c)):
+        if c.hidden:
+            if c.type != "hidden" or not _RE_CONFIRM_PASSWORD.search(t):
+                continue
+            kind = "sync"
+        elif c.type != "password":
+            continue
+        elif "current-password" in tokens or _RE_CURRENT_PASSWORD.search(t):
+            kind = "current"
+        elif "new-password" in tokens or _RE_NEW_PASSWORD.search(t):
             kind = "new"
         else:
-            kind = "confirm" if _RE_CONFIRM_PASSWORD.search(text(c)) else "plain"
-        if kind in ("new", "confirm", "plain") and c.hidden:
-            kind = "sync" if kind == "confirm" or (kind == "new" and c.type == "hidden") else None
-        elif kind != "current" and c.type != "password":
-            kind = None
-        if kind:
-            forms.setdefault(c.form_index, {}).setdefault(kind, []).append(c)
+            kind = "confirm" if _RE_CONFIRM_PASSWORD.search(t) else "plain"
+        forms.setdefault(c.form_index, {}).setdefault(kind, []).append(c)
+
+    def by_index(cs: List[LoginControl]) -> List[LoginControl]:
+        return sorted(cs, key=lambda c: c.index)
+
     out: List[ClassifiedLoginControl] = []
-    for group in forms.values():
+    for form_index, group in forms.items():
         new, confirm, plain, sync, current = (group.get(k, []) for k in ("new", "confirm", "plain", "sync", "current"))
-        hidden_confirmation = any(c.type == "hidden" for c in sync)
-        if new:
-            visible = new + confirm
-        elif plain and (confirm or hidden_confirmation):
-            visible = plain + confirm
+        if new:  # inside a real form a plain box beside the new one is the current password; outside, maybe a sign-in
+            visible, current = new + confirm, current + (plain if form_index is not None else [])
         else:
+            paired = {min(plain, key=lambda p: (abs(p.index - c.index), p.index > c.index)).index
+                      for c in confirm + sync} if plain else set()
+            visible = [p for p in plain if p.index in paired] + (confirm if paired else [])
+        if not visible:
             continue
         weak = (len(visible) == 1 and not sync and not current
                 and not _RE_NEW_PASSWORD.search(text(visible[0])))  # autocomplete=new-password is all there is
-        out += [ClassifiedLoginControl(c, 80 if weak else 100, "new-password") for c in sorted(visible, key=lambda c: c.index)]
-        out += [ClassifiedLoginControl(c, 100, "new-password-sync") for c in sorted(sync, key=lambda c: c.index)]
+        out += [ClassifiedLoginControl(c, 80 if weak else 100, "new-password") for c in by_index(visible)]
+        out += [ClassifiedLoginControl(c, 100, "new-password-sync") for c in by_index(sync)]
+        out += [ClassifiedLoginControl(c, 100, "current-password") for c in by_index(current)]
     return out
 
 
@@ -321,6 +329,13 @@ _DEEP_QUERY_JS = """const deepAll = (sel, root = document) => {
     }
     return out;
   };"""
+
+
+def build_unstamp_js() -> str:
+    """Removes every inspection stamp (open shadow roots included): run when a vault call stops after inspecting a
+    page without filling it, so no marker is left for later DOM reads to address the fields by."""
+    return ("(() => { " + _DEEP_QUERY_JS + ' deepAll("[data-hermes-vault-slot]").forEach((n) => '
+            'n.removeAttribute("data-hermes-vault-slot")); return true; })()')
 
 
 def build_probe_js(selector: str) -> str:

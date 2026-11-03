@@ -45,11 +45,11 @@ class TestWhichFieldsTakeTheNewPassword:
                     _c(2, "password", "password2", "Confirm password")]
         assert _targets(controls) == [(1, "new-password"), (2, "new-password")]
 
-    def test_change_password_page_leaves_the_current_password_alone(self):
+    def test_change_password_page_keeps_the_current_box_for_the_old_password(self):
         controls = [_c(0, "password", "current", "Current password", "current-password"),
                     _c(1, "password", "new", "New password", "new-password"),
                     _c(2, "password", "again", "Repeat new password")]
-        assert _targets(controls) == [(1, "new-password"), (2, "new-password")]
+        assert _targets(controls) == [(0, "current-password"), (1, "new-password"), (2, "new-password")]
 
     @pytest.mark.parametrize("controls", [
         [_c(0, "email", "email", autocomplete="username"), _c(1, "password", "pw", autocomplete="current-password")],
@@ -67,11 +67,26 @@ class TestWhichFieldsTakeTheNewPassword:
     def test_a_change_page_whose_current_box_is_labelled_just_password(self):
         controls = [_c(0, "password", "password", "Password"), _c(1, "password", "new", "New password"),
                     _c(2, "password", "again", "Confirm new password")]
-        assert _targets(controls) == [(1, "new-password"), (2, "new-password")]
+        assert _targets(controls) == [(0, "current-password"), (1, "new-password"), (2, "new-password")]
 
     def test_no_forms_a_sign_in_box_beside_a_sign_up_box(self):
         controls = [_c(0, "password", "pw", "Password", form=None), _c(1, "password", "new_pw", "Create password", form=None)]
         assert _targets(controls) == [(1, "new-password")]
+
+    def test_no_forms_a_sign_in_box_beside_a_sign_up_pair(self):
+        controls = [_c(0, "email", "email", form=None), _c(1, "password", "pw", "Password", form=None),
+                    _c(2, "email", "email2", form=None), _c(3, "password", "pw2", "Password", form=None),
+                    _c(4, "password", "pw3", "Confirm password", form=None)]
+        assert _targets(controls) == [(3, "new-password"), (4, "new-password")]
+
+    @pytest.mark.parametrize("name", ["set_password_token", "create_password_url", "new_password_key"])
+    def test_a_hidden_token_named_after_passwords_is_not_a_confirmation(self, name):
+        assert _targets([_c(0, "password", "pw", "Password"), _c(1, "hidden", name, hidden=True)]) == []
+
+    def test_an_unrendered_password_box_is_never_filled(self):
+        controls = [_c(0, "password", "new", "Create password"),
+                    _c(1, "password", "confirm", "Confirm new password", hidden=True)]
+        assert _targets(controls) == [(0, "new-password")]
 
     def test_only_autocomplete_on_a_lone_box_is_weak_evidence(self):
         """Some sign-in pages mark their password box new-password to block autofill."""
@@ -120,6 +135,7 @@ class _FakePage:
     def __init__(self, url, controls, takes=None, navigated=False, raises=False):
         self.url, self.controls, self.takes, self.navigated, self.raises = url, controls, takes, navigated, raises
         self.written: list[dict] = []
+        self.unstamped = self.reloaded = 0
 
     def focus_page(self, origin, accept=None):
         return {"ok": True, "url": self.url}
@@ -127,6 +143,12 @@ class _FakePage:
     def evaluate_runtime(self, expression):
         if expression == "window.location.href":
             return {"ok": True, "result": self.url}
+        if expression.startswith("location.reload"):
+            self.reloaded += 1
+            return {"ok": True, "result": True}
+        if 'n.removeAttribute("data-hermes-vault-slot")); return true;' in expression:
+            self.unstamped += 1
+            return {"ok": True, "result": True}
         if "getComputedStyle" in expression:  # the inspection; unrendered inputs only when it asks for them
             wanted = self.controls if "const includeHidden = true" in expression else \
                 [c for c in self.controls if not c.get("hidden")]
@@ -188,6 +210,7 @@ def test_a_sign_in_page_is_refused_and_nothing_is_saved(store, page):
     out = json.loads(_set_password(identifier="agi@unforced.test"))
     assert out["success"] is False and out["error_type"] == "no_new_password_field", out
     assert "browser_vault_fill" in out["error"] and page.written == [] and store.list_items() == []
+    assert page.unstamped == 1  # no inspection marker is left on the inputs
 
 
 @pytest.mark.parametrize("identifier", ["", "   ", "agi @unforced.test"])
@@ -234,6 +257,7 @@ def test_the_vault_changes_only_when_the_page_took_the_password(store, page, fai
     assert store.resolve_secret(other.id)["password"] == "theirs-88"
     assert "const fills" not in raw and "data-hermes-vault-slot" not in raw  # no part of the fill script (it holds the value)
     assert page.written == []  # and the page keeps none of it (all-or-nothing fill)
+    assert page.reloaded == (2 if failure.get("raises") else 0)  # the call failed, the script may have run: reload
 
 
 def test_on_a_page_that_only_might_be_a_new_password_page_a_saved_login_is_kept(store, page):
@@ -298,3 +322,50 @@ def test_fill_never_types_a_saved_password_into_a_new_password_box(store, page, 
     out = json.loads(browser_vault_tool.browser_vault_fill(meta.id, task_id="t1"))
     assert out["success"] is False and out["error_type"] == "new_password_page" and "set_password" in out["error"], out
     assert page.written == []
+
+
+CHANGE = [  # a change-password form: current, new, confirm
+    {"index": 0, "type": "password", "name": "current", "label": "Current password", "autocomplete": "current-password",
+     "formIndex": 0},
+    {"index": 1, "type": "password", "name": "new", "label": "New password", "autocomplete": "new-password", "formIndex": 0},
+    {"index": 2, "type": "password", "name": "again", "label": "Confirm new password", "autocomplete": "", "formIndex": 0},
+]
+
+
+def test_a_change_form_gets_the_old_password_in_its_current_box_in_the_same_write(store, page):
+    """Once the vault holds the new password nothing could fill the current box, so it goes in with the new one."""
+    page.controls = CHANGE
+    earlier = store.add_item("login", "kajabi", {"identifier_type": "email", "identifier": "agi@unforced.test",
+                                                 "password": "the-old-one-77"}, origin="https://app.kajabi.test",
+                             generated=True)
+    out = json.loads(_set_password(identifier="agi@unforced.test"))
+    new = store.resolve_secret(earlier.id)["password"]
+    assert out["success"] is True and out["current_password_filled"] is True, out
+    assert sorted((f["index"], f["value"]) for f in page.written) == [(0, "the-old-one-77"), (1, new), (2, new)]
+    store.remove_item(earlier.id)
+    out = json.loads(_set_password(identifier="agi@unforced.test"))  # nothing saved: the current box is the agent's job
+    assert out["current_password_filled"] is False and "CURRENT password" in out["next"], out
+    assert sorted(f["index"] for f in page.written) == [1, 2]
+
+
+def test_a_login_in_a_password_manager_is_left_alone(store, page, monkeypatch):
+    """set_password manages only the Hermes vault: a 1Password/Bitwarden entry for the account would go stale."""
+    import agent.vault_backends as backends
+    from agent.vault_backends.local import LocalLoginBackend
+    from agent.vault_store import VaultItemMeta
+
+    class _Manager:  # an unlocked external manager, faked at its CLI boundary
+        name, display_name, needs_unlock = "onepassword", "1Password", True
+
+        def is_unlocked(self):
+            return True
+
+        def list_items(self):
+            return [VaultItemMeta(id="op:1", kind="login", label="Kajabi", origin="https://app.kajabi.test",
+                                  created_at="", identifier="agi@unforced.test", identifier_type="email",
+                                  allowed_origins=("https://app.kajabi.test",))]
+
+    monkeypatch.setattr(backends, "enabled_backends", lambda: [LocalLoginBackend(), _Manager()])
+    out = json.loads(_set_password(identifier="agi@unforced.test"))
+    assert out["error_type"] == "login_in_password_manager" and "1Password" in out["error"], out
+    assert page.written == [] and store.list_items() == [] and page.unstamped == 1

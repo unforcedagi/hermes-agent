@@ -161,6 +161,14 @@ def _eval_js_secret(task_id: str, expression: str) -> Dict[str, Any]:
     }
 
 
+def _unstamp(task_id: str, refusal: Dict[str, Any]) -> str:
+    """A refusal after the page was inspected: take the inspection's stamps off the inputs first."""
+    from agent.vault_login_classifier import build_unstamp_js
+
+    _eval_js(task_id, build_unstamp_js())
+    return json.dumps(refusal)
+
+
 def _parse_json_result(raw: Any) -> Any:
     if isinstance(raw, str):
         try:
@@ -479,7 +487,7 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, se
         raw_controls = _parse_json_result(raw_controls)
     otp_controls = classify_otp_controls([LoginControl.from_dict(r) for r in (raw_controls or []) if isinstance(r, dict)])
     if not otp_controls:
-        return json.dumps({"success": False, "error_type": "no_code_field",
+        return _unstamp(effective_task_id, {"success": False, "error_type": "no_code_field",
                            "error": ("No one-time-code field on the current page. If the site wants a passkey, hardware key or "
                                      "an approval tap in an app, tell the user to complete it on their device and wait for the page to move on.")})
 
@@ -495,12 +503,12 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, se
     if not code:
         prompt = get_code_prompt_callback()
         if prompt is None or not can_prompt_here():
-            return json.dumps({"success": False, "error_type": "prompt_unavailable",
+            return _unstamp(effective_task_id, {"success": False, "error_type": "prompt_unavailable",
                                "error": (f"{site} asks for a one-time code and this session cannot ask the user (headless/cron/API). "
                                          "Save an authenticator key for this login so codes can be generated automatically.")})
         code = (prompt(site, "") or "").strip().replace(" ", "").replace("-", "")
         if not code:
-            return json.dumps({"success": False, "error_type": "code_declined",
+            return _unstamp(effective_task_id, {"success": False, "error_type": "code_declined",
                                "error": "The user did not enter a code. Do not ask again this turn."})
 
     register_vault_redaction_value(code)
@@ -623,10 +631,11 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, session: str 
         # A saved password never goes into a box that asks for a NEW one (a sign-up "Password" + "Confirm" pair
         # reads as current-password to the login classifier). One predicate decides, the one set_password uses.
         new_targets = [t for t in classify_new_password_controls(controls) if t.token == "new-password"]
-        classified = [c for c in classified if c.control.index not in {t.control.index for t in new_targets}]
+        new_boxes = {t.control.index for t in new_targets}
+        classified = [c for c in classified if c.control.index not in new_boxes]
         if new_targets and not any(c.token == "current-password" for c in classified):
             weak = all(t.score < 100 for t in new_targets)
-            return json.dumps({"success": False, "error_type": "new_password_page", "error": (
+            return _unstamp(effective_task_id, {"success": False, "error_type": "new_password_page", "error": (
                 "This page asks for a NEW password (sign-up, invite or reset), and a saved password is never typed "
                 "into a new-password box. If the account is yours (your own email or username), call "
                 "browser_vault_save_login with set_password=true and identifier=<that username or email>: a strong "
@@ -635,7 +644,8 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, session: str 
                     " The only sign is the box's autocomplete=new-password: if this is in fact a sign-in page (some "
                     "sites mark it so to block autofill), the vault cannot fill it; tell the user." if weak else ""))})
     if not classified:
-        return json.dumps({"success": False, "error": f"No {meta.kind} form fields were found on the current page."})
+        return _unstamp(effective_task_id, {"success": False,
+                                            "error": f"No {meta.kind} form fields were found on the current page."})
 
     # ── Resolve secret and fill (secret never enters any logged string) ─────
     try:
@@ -646,12 +656,11 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, session: str 
             secret = backend.resolve_secret(handle)
             fills = select_checkout_fills(classified, secret, PAYMENT_FIELDS if meta.kind == "payment" else ADDRESS_FIELDS)
     except UnlockRequired:
-        return json.dumps({"success": False, "error_type": "unlock_required",
-                           "error": f"{backend.display_name} locked again; call browser_vault_unlock."})
+        return _unstamp(effective_task_id, {"success": False, "error_type": "unlock_required",
+                                            "error": f"{backend.display_name} locked again; call browser_vault_unlock."})
     if not fills:
-        return json.dumps(
-            {"success": False, "error": f"No fillable {meta.kind} field matched the saved item on this page."}
-        )
+        return _unstamp(effective_task_id,
+                        {"success": False, "error": f"No fillable {meta.kind} field matched the saved item on this page."})
 
     # Register the secret bytes with the model-egress redaction boundary
     # BEFORE they touch the page: any later browser_* result (including
