@@ -43,16 +43,19 @@ def _person_agrees(identifier: str, origin: str) -> bool:
 
 
 def _in_password_manager(origin: str, identifier: str) -> str:
-    """The display name of an unlocked external manager (1Password, Bitwarden) holding a login for this account."""
+    """The display name of an external manager (1Password, Bitwarden) that holds a login for this account, or that
+    is locked or unreadable so it cannot be ruled out."""
     from agent.vault_backends import enabled_backends
 
     for backend in enabled_backends():
-        if backend.name == "local" or (backend.needs_unlock and not backend.is_unlocked()):
+        if backend.name == "local":
             continue
+        if backend.needs_unlock and not backend.is_unlocked():
+            return backend.display_name
         try:
             metas = backend.list_items()
         except Exception:
-            continue
+            return backend.display_name
         if any(m.kind == "login" and (m.identifier or "").casefold() == identifier.casefold()
                and origin in (m.allowed_origins or (m.origin,)) for m in metas):
             return backend.display_name
@@ -67,7 +70,7 @@ def browser_vault_set_password(identifier: str, label: str = "", task_id: Option
                                session: str = "") -> str:
     """Generate a password, fill every new-password field of the exact tab, and save or update the login."""
     from agent.redact import register_vault_redaction_value
-    from agent.vault_login_classifier import LoginControl, build_fill_js, build_inspection_js, classify_new_password_controls
+    from agent.vault_login_classifier import build_fill_js, classify_new_password_controls
     from agent.vault_store import get_vault_store, scrub_secret_from_text
     from tools import browser_vault_tool as bvt
 
@@ -90,15 +93,15 @@ def browser_vault_set_password(identifier: str, label: str = "", task_id: Option
         return _refuse("not_https", (f"Refused: the page{where} is {origin}, not https. A generated password is only "
                                      "set on an https page. Nothing was generated or saved."))
 
+    if bvt._ensure_supervisor(effective_task_id) is None:  # before anything changes: the fill could not run at all
+        return _refuse("supervisor_required", (
+            f"The browser{where} has no CDP connection Hermes can write a secret through (the fallback would put it in "
+            "process arguments). Nothing was generated or saved."))
     nonce = secrets.token_hex(8)
-    inspect = bvt._eval_js(effective_task_id, build_inspection_js(nonce, include_hidden=True))
-    raw_controls = bvt._parse_json_result(inspect.get("result")) if inspect.get("success") else None
-    if isinstance(raw_controls, str):
-        raw_controls = bvt._parse_json_result(raw_controls)
-    if not isinstance(raw_controls, list):
-        return json.dumps({"success": False, "error": f"Could not inspect the page{where}: "
-                                                      f"{str(inspect.get('error') or 'no usable controls')[:200]}"})
-    targets = classify_new_password_controls([LoginControl.from_dict(r) for r in raw_controls if isinstance(r, dict)])
+    controls, inspect_error = bvt._inspect_controls(effective_task_id, nonce, include_hidden=True)
+    if controls is None:
+        return json.dumps({"success": False, "error": f"Could not inspect the page{where}: {inspect_error}"})
+    targets = classify_new_password_controls(controls)
     new_boxes = [t for t in targets if t.token == "new-password"]
 
     def refuse(error_type: str, error: str) -> str:  # after the inspection: take its stamps off the page too
@@ -109,12 +112,21 @@ def browser_vault_set_password(identifier: str, label: str = "", task_id: Option
             f"No new-password field on the page{where} ({origin}). set_password only runs where a site asks for a NEW "
             "password (sign-up, invite, reset). On a sign-in page use browser_vault_fill with the saved handle. "
             "Nothing was generated or saved."))
+    unclear = [t for t in targets if t.token == "unclear-password"]
+    if unclear:
+        named = ", ".join(repr((t.control.label.strip() or t.control.name.strip())[:40]) for t in unclear)
+        return refuse("unclear_password_form", (
+            f"Next to the new-password box{where} there is a password box ({named}) not marked as the current password "
+            "or as a confirmation, and set_password does not guess. Mark it with browser_exec, then call again: "
+            "autocomplete=\"current-password\" if it asks for the current password, autocomplete=\"new-password\" if it "
+            "repeats the new one. Nothing was generated or saved."))
     managed = _in_password_manager(origin, identifier)
     if managed:
         return refuse("login_in_password_manager", (
-            f"{managed} has a login for {identifier} on {origin}; set_password only manages the Hermes vault, so it "
-            f"would leave that entry stale. Ask the user to change the password in {managed}. Nothing was generated "
-            "or saved."))
+            f"{managed} has a login for {identifier} on {origin}, or is locked so it cannot be checked; set_password only "
+            f"manages the Hermes vault and would leave such an entry stale. If it is locked, unlock it "
+            f"(browser_vault_unlock) and call again; if it holds this login, ask the user to change the password in "
+            f"{managed}. Nothing was generated or saved."))
     store = get_vault_store()
     existing = next((m for m in store.list_items() if m.kind == "login" and m.origin == origin
                      and (m.identifier or "").casefold() == identifier.casefold()), None)
@@ -173,7 +185,7 @@ def browser_vault_set_password(identifier: str, label: str = "", task_id: Option
         # The vault changes only when the page took the password. An all-or-nothing fill that ran leaves no field
         # holding it; when the call itself failed (the script may have run), reload the page to discard any.
         reloaded = None
-        if not result.get("success"):
+        if not result.get("success") and result.get("error_type") != "supervisor_required":  # outcome unknown
             reloaded = bool(bvt._eval_js(effective_task_id, "location.reload(), true").get("success"))
         try:
             if existing is not None:
@@ -187,11 +199,12 @@ def browser_vault_set_password(identifier: str, label: str = "", task_id: Option
         if isinstance(parsed, dict) and parsed.get("refused") == "origin_changed":
             return _refuse("origin_changed", f"The page left {origin} before the password went in. Nothing was saved.")
         if not result.get("success"):
-            err = scrub_secret_from_text(str(result.get("error") or "fill failed"), {**secret, **previous})[:200]
-            then = ("The page was reloaded, so it holds none of it." if reloaded else
-                    "The page could not be reloaded: reload it before anything else and do not submit it.")
+            err = scrub_secret_from_text(scrub_secret_from_text(str(result.get("error") or "fill failed"), secret),
+                                         previous)[:200]
+            then = {None: "", True: " The page was reloaded, so it holds none of it."}.get(
+                reloaded, " The page could not be reloaded: reload it before anything else and do not submit it.")
             return json.dumps({"success": False, "error_type": result.get("error_type") or "fill_failed",
-                               "error": f"{err} Nothing was saved. {then}"})
+                               "error": f"{err} Nothing was saved.{then}"})
         took = parsed.get("matched", 0) if isinstance(parsed, dict) else 0
         return _refuse("fill_failed", (f"The page{where} kept {took} of {len(fills)} values, so every field written "
                                        "was emptied again and nothing was saved. Reload the page and try again once."))

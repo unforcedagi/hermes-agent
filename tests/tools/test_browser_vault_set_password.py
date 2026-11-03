@@ -64,14 +64,11 @@ class TestWhichFieldsTakeTheNewPassword:
     def test_a_lone_confirm_style_box_is_a_re_authentication_prompt(self, label):
         assert _targets([_c(0, "password", "pw", label)]) == []
 
-    def test_a_change_page_whose_current_box_is_labelled_just_password(self):
-        controls = [_c(0, "password", "password", "Password"), _c(1, "password", "new", "New password"),
-                    _c(2, "password", "again", "Confirm new password")]
-        assert _targets(controls) == [(0, "current-password"), (1, "new-password"), (2, "new-password")]
-
-    def test_no_forms_a_sign_in_box_beside_a_sign_up_box(self):
-        controls = [_c(0, "password", "pw", "Password", form=None), _c(1, "password", "new_pw", "Create password", form=None)]
-        assert _targets(controls) == [(1, "new-password")]
+    @pytest.mark.parametrize("form", [0, None])
+    @pytest.mark.parametrize("plain", ["Password", "Type it again"])  # a current box, or a confirmation, unmarked
+    def test_a_plain_box_beside_a_new_one_is_unclear_never_guessed(self, form, plain):
+        controls = [_c(0, "password", "pw", plain, form=form), _c(1, "password", "new", "New password", form=form)]
+        assert _targets(controls) == [(0, "unclear-password"), (1, "new-password")]
 
     def test_no_forms_a_sign_in_box_beside_a_sign_up_pair(self):
         controls = [_c(0, "email", "email", form=None), _c(1, "password", "pw", "Password", form=None),
@@ -369,3 +366,52 @@ def test_a_login_in_a_password_manager_is_left_alone(store, page, monkeypatch):
     out = json.loads(_set_password(identifier="agi@unforced.test"))
     assert out["error_type"] == "login_in_password_manager" and "1Password" in out["error"], out
     assert page.written == [] and store.list_items() == [] and page.unstamped == 1
+
+
+def test_an_unclear_box_is_refused_until_the_agent_marks_it(store, page):
+    page.controls = [dict(CHANGE[0], autocomplete="", name="pw", label="Password"), CHANGE[1]]  # current or a repeat?
+    earlier = store.add_item("login", "kajabi", {"identifier_type": "email", "identifier": "agi@unforced.test",
+                                                 "password": "the-old-one-77"}, origin="https://app.kajabi.test",
+                             generated=True)
+    out = json.loads(_set_password(identifier="agi@unforced.test"))
+    assert out["error_type"] == "unclear_password_form" and "'Password'" in out["error"], out
+    assert page.written == [] and page.unstamped == 1
+    assert store.resolve_secret(earlier.id)["password"] == "the-old-one-77"
+    page.controls[0]["autocomplete"] = "current-password"  # what the agent sets with browser_exec
+    assert json.loads(_set_password(identifier="agi@unforced.test"))["current_password_filled"] is True
+    assert [f["value"] for f in page.written if f["index"] == 0] == ["the-old-one-77"]
+
+
+def test_a_locked_password_manager_must_be_unlocked_first(store, page, monkeypatch):
+    import agent.vault_backends as backends
+    from agent.vault_backends.local import LocalLoginBackend
+
+    class _Locked:
+        name, display_name, needs_unlock = "bitwarden", "Bitwarden", True
+
+        def is_unlocked(self):
+            return False
+
+    monkeypatch.setattr(backends, "enabled_backends", lambda: [LocalLoginBackend(), _Locked()])
+    out = json.loads(_set_password(identifier="agi@unforced.test"))
+    assert out["error_type"] == "login_in_password_manager" and "browser_vault_unlock" in out["error"], out
+    assert page.written == [] and store.list_items() == []
+
+
+def test_without_a_supervised_browser_nothing_changes(store, monkeypatch):
+    """The secret is only ever written over the supervisor's CDP socket; without one the vault is not touched."""
+    from tools import browser_tool_session, browser_vault_tool
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+    def agent_browser(session, cmd, args=None, **kwargs):  # the agent-browser CLI: no CDP endpoint to attach to
+        if cmd == "eval":
+            return {"success": True, "data": {"result": "https://app.kajabi.test/password/edit"}}
+        return {"success": False, "error": "no cdp url"}
+
+    monkeypatch.setattr(browser_vault_tool, "_browser_use_mode", lambda: False)
+    monkeypatch.setattr(SUPERVISOR_REGISTRY, "get", lambda task_id: None)
+    monkeypatch.setattr(browser_tool_session, "_run_browser_command", agent_browser)
+    with patch("agent.vault_store.get_vault_store", return_value=store):
+        out = json.loads(_set_password(identifier="agi@unforced.test"))
+    assert out["error_type"] == "supervisor_required", out
+    assert store.list_items() == []

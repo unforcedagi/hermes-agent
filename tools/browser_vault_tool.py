@@ -161,6 +161,22 @@ def _eval_js_secret(task_id: str, expression: str) -> Dict[str, Any]:
     }
 
 
+def _inspect_controls(task_id: str, nonce: str, include_hidden: bool) -> tuple[Optional[list], str]:
+    """``(controls, "")`` for the page's inputs, stamped with ``nonce``; ``(None, error)`` when unreadable (any stamps
+    the script managed to set are taken off again)."""
+    from agent.vault_login_classifier import LoginControl, build_inspection_js
+
+    inspect = _eval_js(task_id, build_inspection_js(nonce, include_hidden=include_hidden))
+    raw = _parse_json_result(inspect.get("result")) if inspect.get("success") else None
+    if isinstance(raw, str):
+        raw = _parse_json_result(raw)
+    if not isinstance(raw, list):
+        if inspect.get("success"):
+            _unstamp(task_id, {})
+        return None, str(inspect.get("error") or "no usable controls")[:200]
+    return [LoginControl.from_dict(r) for r in raw if isinstance(r, dict)], ""
+
+
 def _unstamp(task_id: str, refusal: Dict[str, Any]) -> str:
     """A refusal after the page was inspected: take the inspection's stamps off the inputs first."""
     from agent.vault_login_classifier import build_unstamp_js
@@ -538,9 +554,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, session: str 
     from agent.redact import register_vault_redaction_value
     from agent.vault_login_classifier import (
         ClassifiedLoginControl,
-        LoginControl,
         build_fill_js,
-        build_inspection_js,
         classify_checkout_control,
         classify_login_control,
         classify_new_password_controls,
@@ -612,19 +626,11 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, session: str 
     nonce = secrets.token_hex(8)  # binds this fill to THIS inspection's stamps
     # Logins: unrendered inputs too, for the new-password check only (a type=hidden password confirmation is what
     # marks Kajabi's reset page); they are never fill targets.
-    inspect = _eval_js(effective_task_id, build_inspection_js(nonce, include_hidden=meta.kind == "login"))
-    if not inspect.get("success"):
-        return json.dumps(
-            {"success": False, "error": f"Could not inspect page inputs: {inspect.get('error', 'eval failed')}"}
-        )
-    raw_controls = _parse_json_result(inspect.get("result"))
-    if isinstance(raw_controls, str):
-        raw_controls = _parse_json_result(raw_controls)
-    if not isinstance(raw_controls, list):
-        return json.dumps({"success": False, "error": "Page input inspection returned no usable controls."})
+    controls, inspect_error = _inspect_controls(effective_task_id, nonce, include_hidden=meta.kind == "login")
+    if controls is None:
+        return json.dumps({"success": False, "error": f"Could not inspect page inputs: {inspect_error}"})
 
     classify = classify_login_control if meta.kind == "login" else classify_checkout_control
-    controls = [LoginControl.from_dict(raw) for raw in raw_controls if isinstance(raw, dict)]
     classified: list[ClassifiedLoginControl] = [c for c in map(classify, (c for c in controls if not c.hidden))
                                                 if c is not None]
     if meta.kind == "login":

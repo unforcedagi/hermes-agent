@@ -200,8 +200,9 @@ def classify_new_password_controls(controls: List[LoginControl]) -> List[Classif
     re-authentication prompt, and a sign-in box beside a sign-up pair stays out. Tokens: ``new-password`` for the
     boxes taking the new password, ``new-password-sync`` for a hidden confirmation (only ``type=hidden`` inputs named
     like one; an unrendered password box, e.g. a hidden Register tab, is never filled), and ``current-password`` for
-    the current box of a change form (``current-password``, "current/old password", or a plain box beside a "new"
-    one in the same <form>), which set_password fills only with the saved password it replaces.
+    the current box of a change form (``current-password`` or "current/old password"), which set_password fills
+    only with the saved password it replaces, and ``unclear-password`` for a plain box beside a "new" one: it may be
+    the current password or a confirmation ("Type it again"), and set_password refuses rather than guess.
 
     New-password scores are 100, or 80 when the only evidence is ``autocomplete=new-password`` on a lone box with no
     label, confirmation or current box: some sign-in pages mark their password box that way to block autofill."""
@@ -231,10 +232,11 @@ def classify_new_password_controls(controls: List[LoginControl]) -> List[Classif
         return sorted(cs, key=lambda c: c.index)
 
     out: List[ClassifiedLoginControl] = []
-    for form_index, group in forms.items():
+    for group in forms.values():
         new, confirm, plain, sync, current = (group.get(k, []) for k in ("new", "confirm", "plain", "sync", "current"))
-        if new:  # inside a real form a plain box beside the new one is the current password; outside, maybe a sign-in
-            visible, current = new + confirm, current + (plain if form_index is not None else [])
+        unclear: List[LoginControl] = []
+        if new:  # a plain box beside a new one may be the current password or a confirmation: never guessed
+            visible, unclear = new + confirm, plain
         else:
             paired = {min(plain, key=lambda p: (abs(p.index - c.index), p.index > c.index)).index
                       for c in confirm + sync} if plain else set()
@@ -246,6 +248,7 @@ def classify_new_password_controls(controls: List[LoginControl]) -> List[Classif
         out += [ClassifiedLoginControl(c, 80 if weak else 100, "new-password") for c in by_index(visible)]
         out += [ClassifiedLoginControl(c, 100, "new-password-sync") for c in by_index(sync)]
         out += [ClassifiedLoginControl(c, 100, "current-password") for c in by_index(current)]
+        out += [ClassifiedLoginControl(c, 0, "unclear-password") for c in by_index(unclear)]
     return out
 
 
