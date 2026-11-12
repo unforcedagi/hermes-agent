@@ -502,6 +502,12 @@ def _p_tagged(event: dict, pubkey: str) -> bool:
 # Cap stored parent content snippets (gateway reply injection also clips).
 _EVENT_META_CONTENT_CAP = 500
 _MEDIA_KIND_PRIORITY = (("image", MessageType.PHOTO), ("audio", MessageType.AUDIO), ("video", MessageType.VIDEO))
+def _is_voice_note(metadata: dict) -> bool:
+    """Audio by the sender's imeta: an audio/* type, or an MP4 named *.m4a (how audio passes stock Buzz)."""
+    mime = str(metadata.get("mime_type") or "")
+    return mime.startswith("audio/") or (mime == "video/mp4" and str(metadata.get("filename") or "").lower().endswith(".m4a"))
+
+
 _ATTACHMENT_KIND_TYPES = {"image": MessageType.PHOTO, "video": MessageType.VIDEO, "audio": MessageType.AUDIO, "document": MessageType.DOCUMENT}
 
 
@@ -1561,8 +1567,11 @@ class BuzzAdapter(BasePlatformAdapter):
         try:
             cached = await cache_media_bytes_async(bytes(data), filename=metadata["filename"], mime_type=metadata["mime_type"])
             # A WebM/MP4 container sniffs as video; the sender's imeta says audio (voice notes), so trust it for STT.
-            if cached is not None and cached.kind == "video" and str(metadata["mime_type"]).startswith("audio/"):
-                cached = dataclasses.replace(cached, kind="audio", media_type=metadata["mime_type"])
+            # Stock Buzz only takes audio as a still-picture MP4, so the Uni app sends voice notes as video/mp4 named *.m4a
+            # (uni-app src/media.ts uses the same rule to draw them as voice notes).
+            if cached is not None and cached.kind == "video" and _is_voice_note(metadata):
+                kind_type = metadata["mime_type"] if str(metadata["mime_type"]).startswith("audio/") else "audio/mp4"
+                cached = dataclasses.replace(cached, kind="audio", media_type=kind_type)
             return cached
         except (OSError, ValueError) as exc:
             logger.warning("Buzz: attachment cache write failed: %s", exc)
