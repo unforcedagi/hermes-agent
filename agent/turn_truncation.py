@@ -22,6 +22,7 @@ from agent.turn_api_call import stop_thinking_spinner
 from agent.turn_failure_copy import content_policy_copy, provider_label_for, site_copy, stamp_failure
 from agent.turn_retry_state import TurnRetryState
 from agent.usage_pricing import normalize_usage
+from agent.output_cap import effective_max_tokens
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 
 logger = logging.getLogger("agent.conversation_loop")
@@ -328,7 +329,7 @@ def _retry_truncated_tool_call(st: _Trunc, api_kwargs: Any) -> TruncationVerdict
             agent._buffer_vprint(f"⚠️  Stream interrupted mid tool-call — retrying ({n}/4)...")
         else:
             agent._buffer_vprint(f"⚠️  Truncated tool call detected — retrying API call ({n}/4)...")
-        _tc_boost = (agent.max_tokens if agent.max_tokens else 4096) * (2 ** n)
+        _tc_boost = (effective_max_tokens(agent) or 4096) * (2 ** n)
         _tc_requested_cap = agent._requested_output_cap_from_api_kwargs(api_kwargs)
         if _tc_requested_cap is not None:
             _tc_boost = max(_tc_boost, _tc_requested_cap)
@@ -569,7 +570,7 @@ def continue_codex_incomplete(
             # output_tokens IS that ceiling, so seed the escalation from it (else 4096).
             usage = getattr(response, "usage", None)
             observed = getattr(usage, "output_tokens", None) if not isinstance(usage, dict) else usage.get("output_tokens")
-            base = agent.max_tokens or int(observed or 0) or 4096
+            base = effective_max_tokens(agent) or int(observed or 0) or 4096
             agent._ephemeral_max_output_tokens = min(base * (2 ** n), max(32768, base))
         if not agent.quiet_mode:
             agent._vprint(f"{agent.log_prefix}↻ Codex response incomplete; continuing turn ({n}/3)", diagnostic=True)

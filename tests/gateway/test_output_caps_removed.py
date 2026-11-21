@@ -1,4 +1,7 @@
-"""User configuration cannot impose generation caps; wire budgets remain internal."""
+"""Legacy output-cap settings (``HERMES_MAX_TOKENS``, ``providers.*.max_output_tokens``, MoA and
+model_overrides caps) never reach the runtime; wire budgets remain internal. ``model.max_tokens`` is
+not a runtime kwarg either: the agent reads it itself for the configured default model
+(``agent/output_cap.py``, ``tests/agent/test_config_output_cap.py``)."""
 
 import json
 

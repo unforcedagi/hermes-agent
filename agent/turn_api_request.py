@@ -13,6 +13,7 @@ import logging
 from typing import Any
 
 from agent.message_sanitization import sanitize_outbound_kwargs, strip_images_for_rejecting_model
+from agent.output_cap import effective_max_tokens
 from utils import env_var_enabled
 
 logger = logging.getLogger("agent.conversation_loop")
@@ -80,7 +81,7 @@ def _fire_pre_api_request_hook(
                 tool_count=len(agent.tools or []),
                 approx_input_tokens=approx_tokens,
                 request_char_count=total_chars,
-                max_tokens=agent.max_tokens,
+                max_tokens=effective_max_tokens(agent),
                 started_at=api_start_time,
                 middleware_trace=list(_llm_middleware_trace),
                 request=agent._api_request_payload_for_hook(api_kwargs),

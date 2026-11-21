@@ -19,6 +19,7 @@ from typing import Any, Dict
 from agent.display import KawaiiSpinner
 from agent.interrupt_control import interrupt_issuer
 from agent.turn_context_compaction import _reanchor
+from agent.output_cap import effective_max_tokens
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -505,7 +506,7 @@ def apply_retry_restarts(
         # Boost output budget per retry: 2×, 4×, 8×, 16× base, capped at 32 768, via
         # _ephemeral_max_output_tokens. Keep a larger original provider/model
         # default as the floor so retries never downshift.
-        _boost = (agent.max_tokens or 4096) * (2 ** length_continue_retries)
+        _boost = (effective_max_tokens(agent) or 4096) * (2 ** length_continue_retries)
         _requested_cap = agent._requested_output_cap_from_api_kwargs(api_kwargs)
         if _requested_cap is not None:
             _boost = max(_boost, _requested_cap)

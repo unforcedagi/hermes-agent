@@ -1654,9 +1654,10 @@ def _active_route_url(agent, base_url) -> str:
 
 
 def _scope_context_length_to_default_runtime(
-    agent, _agent_cfg, _model_cfg, _custom_providers, _config_context_length, base_url
+    agent, _agent_cfg, _model_cfg, _custom_providers, _config_context_length, base_url,
+    setting: str = "model.context_length",
 ) -> Optional[int]:
-    """Return ``model.context_length`` only if it describes the active runtime.
+    """Return ``model.context_length`` (or another ``model.*`` *setting*) only if it describes the active runtime.
 
     It describes the configured default model; a ``--model`` launch has already replaced
     ``agent.model``, so carrying the default's window into that runtime is stale. Live
@@ -1688,9 +1689,9 @@ def _scope_context_length_to_default_runtime(
     )
     if _model_mismatch or _route_mismatch:
         _ra().logger.debug(
-            "Ignoring model.context_length=%s for startup runtime %s at %s "
+            "Ignoring %s=%s for startup runtime %s at %s "
             "(configured default is %s at %s)",
-            _config_context_length,
+            setting, _config_context_length,
             agent.model,
             _active_base_url or agent.provider,
             _configured_default_model,
@@ -1850,6 +1851,31 @@ def _resolve_context_length(agent, _agent_cfg, base_url):
     return _config_context_length, _custom_providers, _effective_context_length, _model_cfg
 
 
+def _resolve_config_max_tokens(agent, _agent_cfg, _custom_providers, base_url) -> None:
+    """Read ``model.max_tokens`` (the configured default model's output cap) once, scoped like
+    ``model.context_length``, and remember the route it belongs to (``agent/output_cap.py``)."""
+    agent._config_max_tokens = None
+    agent._config_max_tokens_route = None
+    _model_cfg = _agent_cfg.get("model", {}) if isinstance(_agent_cfg, dict) else {}
+    if not isinstance(_model_cfg, dict) or _model_cfg.get("max_tokens") is None:
+        return
+    _raw = _model_cfg.get("max_tokens")
+    _cap = _positive_int(_raw, reject=(bool, float))
+    if _cap is None:
+        _warn_invalid_config_int(
+            "model.max_tokens in config.yaml", _raw, "must be a positive integer (e.g. 16384)",
+            "no output cap", "the server's default output limit", agent=agent,
+        )
+        return
+    _cap = _scope_context_length_to_default_runtime(
+        agent, _agent_cfg, _model_cfg, _custom_providers, _cap, base_url, setting="model.max_tokens",
+    )
+    if _cap is not None:
+        from agent.output_cap import output_cap_route
+        agent._config_max_tokens = _cap
+        agent._config_max_tokens_route = output_cap_route(agent)
+
+
 def _select_context_engine(_agent_cfg):
     """Config-driven context engine: ``context.engine`` → plugins/context_engine/<name>/ →
     general plugin system → None (built-in ContextCompressor)."""
@@ -1899,11 +1925,13 @@ def _select_context_engine(_agent_cfg):
 
 
 def _compressor_max_tokens(agent):
-    """``agent.max_tokens``, or the native-Gemini adapter default when unset: generateContent
+    """The request's output cap (``agent/output_cap.py``), or the native-Gemini adapter default when unset: generateContent
     still sends maxOutputTokens=65,535 and the threshold is pct×(window − max_tokens), so
     reserving 0 let the provider 400 before compaction fired."""
-    if agent.max_tokens is not None:
-        return agent.max_tokens
+    from agent.output_cap import effective_max_tokens
+    _cap = effective_max_tokens(agent)
+    if _cap is not None:
+        return _cap
     with suppress(Exception):
         from agent.gemini_native_adapter import (
             GEMINI_DEFAULT_MAX_OUTPUT_TOKENS, is_native_gemini_base_url
@@ -2430,6 +2458,7 @@ def init_agent(
     _config_context_length, _custom_providers, _effective_context_length, _model_cfg = _resolve_context_length(
         agent, _agent_cfg, base_url
     )
+    _resolve_config_max_tokens(agent, _agent_cfg, _custom_providers, base_url)
     _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, session_db)
     _configure_ollama_num_ctx(agent, _model_cfg, _config_context_length)
     _enforce_minimum_context(agent)

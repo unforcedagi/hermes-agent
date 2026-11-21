@@ -895,7 +895,7 @@ hermes model
 **Tool calling:** Use `--tool-call-parser` with the appropriate parser for your model family: `qwen` (Qwen 2.5), `llama3`, `llama4`, `deepseekv3`, `mistral`, `glm`. Without this flag, tool calls come back as plain text.
 
 :::caution SGLang defaults to 128 max output tokens
-If responses seem truncated, check the server's generation default and configure it on the server (for example SGLang's `--default-max-tokens`). Hermes does not expose an output-token cap setting.
+If responses seem truncated, check the server's generation default and configure it on the server (for example SGLang's `--default-max-tokens`), or set `model.max_tokens` (see [Context Length Detection](#context-length-detection)).
 :::
 
 ---
@@ -1166,7 +1166,7 @@ model:
 #### Responses get cut off mid-sentence
 
 **Possible causes:**
-1. **Low output limit on the server** — configure the server's generation default (for example SGLang's `--default-max-tokens`). Hermes does not expose an output-token cap setting. Response length is distinct from the conversation's context window (`context_length`).
+1. **Low output limit on the server** — configure the server's generation default (for example SGLang's `--default-max-tokens`), or set `model.max_tokens` for the configured model. Response length is distinct from the conversation's context window (`context_length`).
 2. **Context exhaustion** — The model filled its context window. Increase `model.context_length` or enable [context compression](../user-guide/configuration.md#context-compression) in Hermes.
 
 ---
@@ -1266,10 +1266,25 @@ model:
 **`context_length`** is the **total context window** — the combined budget for input *and* output tokens (e.g. 200,000 for Claude Opus 4.6). Hermes uses this to decide when to compress history and to validate API requests.
 
 Output limits govern a single generated response, not the conversation history.
-Hermes no longer reads `model.max_tokens`, `HERMES_MAX_TOKENS`, provider output-cap
-settings, or `model_overrides.*.*.max_output_tokens`. Remove these legacy settings.
-Custom OpenAI-compatible endpoints receive no automatic catalog-sized output cap.
-Their server defaults apply; these can be lower than the model maximum.
+`model.max_tokens` sets the output cap for your configured default model. It applies
+only while Hermes runs that model on that route: another model, a `/model` switch, a
+fallback or a subagent on a different model does not inherit it. Set it for a reasoning
+model on a custom endpoint (vLLM, llama.cpp, SGLang): without it Hermes sends no cap and
+the server's default applies, which on vLLM is the whole remaining context window, so the
+model can think for a very long time.
+
+```yaml
+model:
+  provider: custom
+  default: my-reasoning-model
+  base_url: http://127.0.0.1:8000/v1
+  max_tokens: 16384
+```
+
+Custom OpenAI-compatible endpoints receive no automatic catalog-sized output cap: a
+guessed number can exceed what a local server accepts. Hermes does not read
+`HERMES_MAX_TOKENS`, provider output-cap settings, or
+`model_overrides.*.*.max_output_tokens`; remove these legacy settings.
 
 Native Anthropic Messages (including the native Anthropic Bedrock path) requires
 `max_tokens`, so Hermes supplies an internal value. Bedrock Converse is a separate
