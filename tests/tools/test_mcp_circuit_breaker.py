@@ -610,3 +610,48 @@ def test_breaker_opened_by_tool_errors_says_rejected_not_unreachable(monkeypatch
         _cleanup(mcp_tool, "srv")
         mcp_tool._server_errors_all_application.pop("srv", None)
 
+
+
+def test_invalid_params_rejection_never_trips_the_outage_breaker(monkeypatch, tmp_path):
+    """A JSON-RPC ``-32602 Invalid params`` reply is the server answering that the CALL was wrong
+    (Parachute vault: an update without ``if_updated_at``). It must never count toward the outage
+    breaker: a model that sends a bad argument three times and then fixes it must reach the server
+    on the fourth call, and must see the server's own message and hint, not "unreachable" (T-488)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from mcp.shared.exceptions import MCPError
+    from tools import mcp_tool
+    from tools.mcp_tool_handlers import _make_tool_handler
+
+    calls = []
+    hint = "re-read the note, pass its updated_at as if_updated_at, or pass force: true to skip the check"
+
+    async def _call_tool(name, arguments=None, *a, **kw):
+        calls.append(dict(arguments or {}))
+        if "if_updated_at" not in (arguments or {}):
+            raise MCPError(code=-32602, message="update requires `if_updated_at` or `force: true`.",
+                           data={"error_type": "precondition_required", "hint": hint})
+        result = MagicMock()
+        result.is_error = False
+        block = MagicMock()
+        block.text = "updated"
+        result.content = [block]
+        result.structured_content = None
+        return result
+
+    _install_stub_server(mcp_tool, "vault", _call_tool)
+    _mcp_loop._ensure_mcp_loop()
+    try:
+        handler = _make_tool_handler("vault", "update_note", 10.0)
+        for _ in range(mcp_tool._CIRCUIT_BREAKER_THRESHOLD + 1):
+            err = json.loads(handler({"id": "n1"}))["error"]
+            assert "if_updated_at" in err and hint in err, err
+            assert "unreachable" not in err.lower() and "paused" not in err.lower(), err
+        assert mcp_tool._server_error_counts.get("vault", 0) == 0
+
+        fixed = json.loads(handler({"id": "n1", "if_updated_at": "2026-11-20T00:00:00Z"}))
+        assert fixed.get("result") == "updated", fixed
+        assert len(calls) == mcp_tool._CIRCUIT_BREAKER_THRESHOLD + 2, "every call must reach the server"
+    finally:
+        _cleanup(mcp_tool, "vault")
+        mcp_tool._server_errors_all_application.pop("vault", None)

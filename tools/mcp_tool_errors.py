@@ -411,6 +411,25 @@ def _iter_exception_nodes(exc: BaseException) -> List[BaseException]:
     return ordered
 
 
+# JSON-RPC "Invalid params": the server read the request and rejected the arguments (a missing
+# precondition field, a schema violation). The MCP SDK raises it for its own input validation too.
+_JSONRPC_INVALID_PARAMS = -32602
+
+
+def _invalid_params_error(exc: BaseException) -> Optional[Any]:
+    """The ``ErrorData`` of a ``-32602 Invalid params`` reply anywhere in *exc*'s tree, else None.
+
+    Structural code only, never a message substring: this reply proves the server is up and the
+    CALL was wrong, so callers must not count it as an outage. ``-32600`` is deliberately not
+    included: the SDK also uses it for "Session not found" / "Session terminated", which are
+    transport problems the session-expired recoverer owns."""
+    for node in _iter_exception_nodes(exc):
+        error = getattr(node, "error", None)
+        if getattr(error, "code", None) == _JSONRPC_INVALID_PARAMS:
+            return error
+    return None
+
+
 def _format_connect_error(exc: BaseException) -> str:
     """Render nested MCP connection errors into an actionable short message."""
     nodes = _iter_exception_nodes(exc)

@@ -21,7 +21,7 @@ from tools.mcp_tool_content import (
     _MCP_HARD_RESULT_CAP_CHARS, _cache_mcp_audio_block, _cache_mcp_image_block,
     _render_mcp_dropped_block_notice, _render_mcp_resource_block, _strip_reserved_meta_keys,
     _truncate_mcp_text_result)
-from tools.mcp_tool_errors import _is_auth_error, _is_session_expired_error
+from tools.mcp_tool_errors import _invalid_params_error, _is_auth_error, _is_session_expired_error
 
 logger = logging.getLogger("tools.mcp_tool")
 _MISSING = object()
@@ -322,6 +322,30 @@ def _handle_stdio_child_exited_and_retry(server_name: str, exc: Exception, retry
             f"{type(retry_exc).__name__}: {_exc_str(retry_exc)}"))
 
 
+def _invalid_params_result(server_name: str, op: str, error: Any, record_outcome: bool) -> str:
+    """The server's ``-32602 Invalid params`` reply, as the tool's own answer. The server is up and
+    the arguments were wrong, so this is never an outage strike: counting it let three bad
+    arguments in a row lock the server out for the breaker cooldown as "unreachable", and the
+    model gave up instead of fixing the call (T-488). A completed round trip closes the outage
+    count. Repeating the identical bad call is the per-turn tool guardrail's job
+    (``agent/tool_guardrails.py``), not the outage breaker's. The reply's ``data`` (vault hints
+    such as "pass its updated_at as if_updated_at") is kept so the model can fix the call."""
+    if record_outcome:
+        _core._reset_server_error(server_name)
+    message = str(getattr(error, "message", "") or "invalid params")
+    data = getattr(error, "data", None)
+    if data not in (None, "", {}, []):
+        try:
+            detail = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            detail = str(data)
+        message = f"{message} {detail}"
+    logger.info("MCP %s/%s rejected the arguments (-32602): %s", server_name, op, message)
+    return tool_error(_sanitize_error(_truncate_mcp_text_result(
+        f"MCP server '{server_name}' rejected the arguments (the server is reachable; fix the call and retry): "
+        f"{message}")), invalid_params=True)
+
+
 def _dispatch(server_name: str, server: Any, op: str, call, tool_timeout: float, recoverers,
               on_final_failure: Callable[[BaseException], None], record_outcome: bool = False) -> str:
     """Mark the call started on *server* (doubles may lack ``mark_tool_call``), run coroutine function *call*
@@ -340,6 +364,9 @@ def _dispatch(server_name: str, server: Any, op: str, call, tool_timeout: float,
     except InterruptedError:
         return tool_error("MCP call interrupted: user sent a new message")
     except Exception as exc:
+        rejected = _invalid_params_error(exc)
+        if rejected is not None:
+            return _invalid_params_result(server_name, op, rejected, record_outcome)
         for recover in recoverers:
             recovered = recover(server_name, exc, call_once, op)
             if recovered is not None:
