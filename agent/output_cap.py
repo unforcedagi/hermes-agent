@@ -7,20 +7,21 @@ There is no automatic default: a guessed number can exceed what a local server a
 so with no setting the server's default still applies.
 
 Like ``model.context_length``, the value describes the configured default route. It is read once
-at construction (``agent_init._resolve_config_max_tokens``) together with the route it belongs
-to, and applies only while the agent runs on that route: a ``--model`` launch, ``/model`` switch,
-fallback or delegated child on another model or endpoint never inherits it, and restoring the
-primary runtime brings it back. An explicit ``max_tokens`` passed to ``AIAgent`` (internal
+at construction (``agent_init._resolve_config_max_tokens``) and applies only while the agent runs
+on that route, checked with the same scoping as ``model.context_length`` once per runtime: a
+``--model`` launch, ``/model`` switch, fallback or delegated child on another model or endpoint
+never inherits it, and switching onto (or restoring) the configured model brings it back. An explicit ``max_tokens`` passed to ``AIAgent`` (internal
 bounded tasks) always wins.
 """
 
+from contextlib import suppress
 from typing import Any, Optional, Tuple
 
 from hermes_cli.route_identity import normalize_route_base_url
 
 
 def output_cap_route(agent: Any) -> Tuple[str, str, str]:
-    """The (model, provider, route URL) a configured cap belongs to."""
+    """The runtime identity the scope decision is memoized on: (model, provider, route URL)."""
     return (
         str(getattr(agent, "model", "") or ""),
         str(getattr(agent, "provider", "") or "").strip().lower(),
@@ -34,6 +35,33 @@ def effective_max_tokens(agent: Any) -> Optional[int]:
     if explicit is not None:
         return explicit
     cap = getattr(agent, "_config_max_tokens", None)
-    if cap and getattr(agent, "_config_max_tokens_route", None) == output_cap_route(agent):
+    if not cap:
+        return None
+    route = output_cap_route(agent)
+    memo = getattr(agent, "_config_max_tokens_memo", None)
+    if memo is None or memo[0] != route:  # decided once per runtime, not per request
+        applies = False
+        with suppress(Exception):
+            from agent.agent_init import config_max_tokens_applies  # lazy: agent_init imports this module
+            applies = config_max_tokens_applies(agent)
+        memo = agent._config_max_tokens_memo = (route, applies)
+    return cap if memo[1] else None
+
+
+def output_reservation(agent: Any) -> Optional[int]:
+    """The output the compressor reserves out of the window on the CURRENT runtime: the request's cap,
+    or the native-Gemini adapter default when unset (generateContent still sends maxOutputTokens=65,535
+    and the threshold is pct x (window - max_tokens), so reserving 0 let the provider 400 before
+    compaction fired). None keeps the compressor's existing reservation. Re-derived on every runtime
+    change (switch, fallback, primary restore) so it tracks the cap actually sent."""
+    cap = effective_max_tokens(agent)
+    if cap is not None:
         return cap
+    with suppress(Exception):
+        from agent.gemini_native_adapter import GEMINI_DEFAULT_MAX_OUTPUT_TOKENS, is_native_gemini_base_url
+        gemini_provider = str(getattr(agent, "provider", "") or "").strip().lower() in {
+            "gemini", "google", "google-gemini", "google-ai-studio",
+        }
+        if gemini_provider or is_native_gemini_base_url(getattr(agent, "base_url", "")):
+            return GEMINI_DEFAULT_MAX_OUTPUT_TOKENS
     return None

@@ -39,6 +39,7 @@ from agent.tool_guardrails import (
 )
 from hermes_cli.config import DEFAULT_CONFIG, cfg_get
 from hermes_cli.route_identity import normalize_route_base_url
+from agent.output_cap import output_reservation
 from hermes_cli.timeouts import get_provider_request_timeout
 from hermes_constants import get_hermes_home
 from hermes_state_ids import new_session_id
@@ -1851,11 +1852,13 @@ def _resolve_context_length(agent, _agent_cfg, base_url):
     return _config_context_length, _custom_providers, _effective_context_length, _model_cfg
 
 
-def _resolve_config_max_tokens(agent, _agent_cfg, _custom_providers, base_url) -> None:
-    """Read ``model.max_tokens`` (the configured default model's output cap) once, scoped like
-    ``model.context_length``, and remember the route it belongs to (``agent/output_cap.py``)."""
+def _resolve_config_max_tokens(agent, _agent_cfg, _custom_providers) -> None:
+    """Read ``model.max_tokens`` (the configured default model's output cap) once. Whether it applies
+    is decided per runtime by ``agent/output_cap.py``, with the same scoping as ``model.context_length``,
+    so an agent started on another model still picks it up after a switch onto the configured one."""
     agent._config_max_tokens = None
-    agent._config_max_tokens_route = None
+    agent._config_max_tokens_scope = None
+    agent._config_max_tokens_memo = None
     _model_cfg = _agent_cfg.get("model", {}) if isinstance(_agent_cfg, dict) else {}
     if not isinstance(_model_cfg, dict) or _model_cfg.get("max_tokens") is None:
         return
@@ -1867,13 +1870,17 @@ def _resolve_config_max_tokens(agent, _agent_cfg, _custom_providers, base_url) -
             "no output cap", "the server's default output limit", agent=agent,
         )
         return
-    _cap = _scope_context_length_to_default_runtime(
-        agent, _agent_cfg, _model_cfg, _custom_providers, _cap, base_url, setting="model.max_tokens",
-    )
-    if _cap is not None:
-        from agent.output_cap import output_cap_route
-        agent._config_max_tokens = _cap
-        agent._config_max_tokens_route = output_cap_route(agent)
+    agent._config_max_tokens = _cap
+    agent._config_max_tokens_scope = (_agent_cfg, _model_cfg, _custom_providers)
+
+
+def config_max_tokens_applies(agent) -> bool:
+    """True when the configured cap describes ``agent``'s current runtime (``model.context_length`` scoping)."""
+    _agent_cfg, _model_cfg, _custom_providers = agent._config_max_tokens_scope
+    return _scope_context_length_to_default_runtime(
+        agent, _agent_cfg, _model_cfg, _custom_providers, agent._config_max_tokens,
+        str(getattr(agent, "base_url", "") or ""), setting="model.max_tokens",
+    ) is not None
 
 
 def _select_context_engine(_agent_cfg):
@@ -1924,26 +1931,6 @@ def _select_context_engine(_agent_cfg):
     return _selected_engine
 
 
-def _compressor_max_tokens(agent):
-    """The request's output cap (``agent/output_cap.py``), or the native-Gemini adapter default when unset: generateContent
-    still sends maxOutputTokens=65,535 and the threshold is pct×(window − max_tokens), so
-    reserving 0 let the provider 400 before compaction fired."""
-    from agent.output_cap import effective_max_tokens
-    _cap = effective_max_tokens(agent)
-    if _cap is not None:
-        return _cap
-    with suppress(Exception):
-        from agent.gemini_native_adapter import (
-            GEMINI_DEFAULT_MAX_OUTPUT_TOKENS, is_native_gemini_base_url
-        )
-        _gemini_provider = str(agent.provider or "").strip().lower() in {
-            "gemini", "google", "google-gemini", "google-ai-studio",
-        }
-        if _gemini_provider or is_native_gemini_base_url(agent.base_url):
-            return GEMINI_DEFAULT_MAX_OUTPUT_TOKENS
-    return None
-
-
 def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, session_db):
     _selected_engine = _select_context_engine(_agent_cfg)
     if _selected_engine is not None:
@@ -1978,7 +1965,7 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
             api_key=getattr(agent, "api_key", ""), config_context_length=_effective_context_length,
             provider=agent.provider, api_mode=agent.api_mode,
             abort_on_summary_failure=cs.abort_on_summary_failure,
-            max_tokens=_compressor_max_tokens(agent), model_thresholds=cs.model_thresholds,
+            max_tokens=output_reservation(agent), model_thresholds=cs.model_thresholds,
             threshold_tokens_cap=cs.threshold_tokens,
             proactive_prune_tokens=cs.proactive_prune_tokens,
             proactive_prune_min_result_chars=cs.proactive_prune_min_chars,
@@ -2458,7 +2445,7 @@ def init_agent(
     _config_context_length, _custom_providers, _effective_context_length, _model_cfg = _resolve_context_length(
         agent, _agent_cfg, base_url
     )
-    _resolve_config_max_tokens(agent, _agent_cfg, _custom_providers, base_url)
+    _resolve_config_max_tokens(agent, _agent_cfg, _custom_providers)
     _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, session_db)
     _configure_ollama_num_ctx(agent, _model_cfg, _config_context_length)
     _enforce_minimum_context(agent)

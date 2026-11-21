@@ -183,6 +183,9 @@ def _retry_once(server_name: str, retry_call, op_description: str, what: str):
     try:
         result = retry_call()
     except Exception as retry_exc:
+        rejected = _invalid_params_error(retry_exc)
+        if rejected is not None:  # the retry reached the server and it rejected the arguments
+            return _invalid_params_result(server_name, None, op_description, rejected)
         logger.warning("MCP %s/%s retry after %s failed: %s", server_name, op_description, what, retry_exc)
         return None
     return _record_call_outcome(server_name, result)
@@ -316,6 +319,9 @@ def _handle_stdio_child_exited_and_retry(server_name: str, exc: Exception, retry
             )
         return _strike(server_name, _STDIO_DIED_AGAIN_MSG.format(s=server_name))
     except Exception as retry_exc:
+        rejected = _invalid_params_error(retry_exc)
+        if rejected is not None:  # the respawned server answered and rejected the arguments
+            return _invalid_params_result(server_name, None, op_description, rejected)
         logger.warning("MCP %s/%s retry after stdio respawn failed: %s", server_name, op_description, retry_exc)
         return _strike(server_name, _sanitize_error(
             f"MCP call failed after respawning the stdio subprocess for '{server_name}': "

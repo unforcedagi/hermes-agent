@@ -84,8 +84,11 @@ def test_configured_cap_reaches_the_custom_endpoint(tmp_path, monkeypatch, local
     # Another model on the same endpoint is not the configured default: no inherited cap,
     # whether it is started on that model or switched to it live (/model).
     requests.clear()
-    _chat(base_url, model="other-model")
+    other = _chat(base_url, model="other-model")
     assert requests and "max_tokens" not in requests[-1], requests[-1]
+    # Switching onto the configured model brings the cap AND the compressor's output reservation.
+    other.switch_model("local-model", "custom", api_key="local-test", base_url=base_url)
+    assert other.context_compressor.max_tokens == 7777
 
     agent = _chat(base_url)
     requests.clear()

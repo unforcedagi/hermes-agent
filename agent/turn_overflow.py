@@ -27,6 +27,7 @@ from agent.model_metadata import (
     parse_available_output_tokens_from_error,
 )
 from agent.turn_failure_copy import site_copy, stamp_failure
+from agent.output_cap import effective_max_tokens
 from agent.turn_retry_state import TurnRetryState
 from utils import base_url_host_matches
 
@@ -404,7 +405,7 @@ def _recover_context_length(st: _Recovery, _retry: TurnRetryState, error_msg: st
     # Only when the server quoted NO measurement of its own: "prompt is too long: 233153 tokens
     # > 200000" is the server's count and beats the local estimate.
     window = agent.context_compressor.context_length
-    request_tokens = st.request_tokens() + max(0, int(getattr(agent, "max_tokens", 0) or 0))
+    request_tokens = st.request_tokens() + max(0, int(effective_max_tokens(agent) or 0))
     if (
         not re.search(r"\d{4,}", error_msg)
         and isinstance(window, int) and window > 0

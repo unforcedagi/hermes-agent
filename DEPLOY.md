@@ -6,8 +6,8 @@ Nothing live changes until Uni merges and the gateway restarts.
 ## What changes
 
 1. **MCP breaker.** A JSON-RPC `-32602 Invalid params` reply (the Parachute vault's answer to an update without
-   `if_updated_at`) is now the tool's answer: no strike, the outage count resets, and the model sees the server's
-   message and hint. Before, three in a row marked the server "unreachable" for 60 s.
+   `if_updated_at`) is now the tool's answer: it neither adds nor clears a breaker strike, and the model sees the
+   server's message and hint. Before, three in a row marked the server "unreachable" for 60 s.
 2. **Output cap.** `model.max_tokens` in config.yaml now reaches the wire for the configured default model on its own
    route. With no setting nothing changes: the server's default applies. The live config does not set it, so live
    requests to Claude are unchanged.
