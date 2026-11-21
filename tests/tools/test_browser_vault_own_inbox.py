@@ -155,7 +155,9 @@ def test_reader_refuses_an_inbox_it_holds_no_key_for(mailbox):
     ("Sign in", "This code is valid until Nov 21, 2026. Code: 482913", "482913"),
     ("Sign in", "We sent a code to the phone ending in 4321. Your code is 482913", "482913"),
     ("Order", "Order 12345678 received. Your verification code is 4821.", "4821"),
-    ("Code", "Your code is 2024.", "2024"),
+    ("Code", "Your code is 2024.", "2024"),  # a year-like code still counts when it is the only number
+    ("482913 is your Acme verification code", "If you didn't request this code, write to Acme, 1600 Main St", "482913"),
+    ("Sign in", "482913 is your code. \u00a92026 Acme", "482913"),
     ("Code", "Your code is \u0664\u0668\u0662\u0661\u0669\u0663", None),  # only ASCII digits are typed
     ("Hello", "Call 555 0100 or 555 0199 about 301122 or 301133", None),  # ambiguous: no code
     ("Receipt", "Total 2026 items, ref 12", None),
@@ -198,7 +200,8 @@ def test_sender_matches_the_from_domain_not_a_substring(frm, sender, ok):
 
 
 @pytest.mark.parametrize("sender,ok", [("acme.test", True), ("no-reply@gmail.com", True), ("com", False),
-                                       ("gmail.com", False), (".com", False)])
+                                       ("gmail.com", False), (".com", False), ("co.uk", False), ("github.io", False),
+                                       ("@acme.test", False), ("x@", False)])
 def test_a_sender_must_name_one_site(sender, ok):
     assert _reader_module().sender_ok(sender) is ok
 

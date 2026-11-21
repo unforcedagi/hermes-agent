@@ -502,11 +502,13 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, se
     from tools import browser_vault_tool_own_inbox as own
 
     own_cfg = own.own_inbox_config() if from_inbox else {}
-    inbox, basis, refusal = own.gate(own_cfg, inbox, sender, origin, allowed, named_site) if from_inbox else (inbox, None, None)
-    # A saved authenticator key mints the code without any mail, so its gate refusal waits until that has failed.
+    # A saved authenticator key mints the code without any mail: the inbox gate runs only if that yields nothing.
     minted = meta is not None and getattr(meta, "has_otp", False)
-    if refusal and not minted:
-        return json.dumps(refusal)
+    basis = None
+    if from_inbox and not minted:
+        inbox, basis, refusal = own.gate(own_cfg, inbox, sender, origin, allowed, named_site)
+        if refusal:
+            return json.dumps(refusal)
 
     nonce = secrets.token_hex(8)
     inspect = _eval_js(effective_task_id, build_inspection_js(nonce))
@@ -529,8 +531,10 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, se
         if code:
             source = backend.name
     if not code and from_inbox:
-        if refusal:
-            return _unstamp(effective_task_id, refusal)
+        if minted:
+            inbox, basis, refusal = own.gate(own_cfg, inbox, sender, origin, allowed, named_site)
+            if refusal:
+                return _unstamp(effective_task_id, refusal)
         code, err = own.fetch_code(inbox, sender, wait_s, own_cfg)
         if not code:
             own.audit("not found" if not err else "reader failed", origin, basis, inbox, sender)

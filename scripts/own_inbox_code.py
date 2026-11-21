@@ -45,6 +45,12 @@ _KEYWORDS = re.compile(r"\b(?:code|passcode|verification|one[- ]time|otp|pin)\b"
 _CODE = re.compile(r"(?<![\w/#.$€£:-])([0-9]{3,4}[ -][0-9]{3,4}|[0-9]{4,8})(?![\w/%:-]|\.[0-9])")
 _NEAR = 80  # characters after a keyword that still count as "the code it names"
 _BEFORE = 40  # ... and before it ("123456 is your code")
+_YEAR = re.compile(r"(?:19|20)[0-9]{2}")
+_EMAIL = re.compile(r"[^@\s:]+@[^@\s:]+\.[^@\s:]+")
+# Domains many unrelated senders share: naming one would not name a site.
+_SHARED = {"co.uk", "org.uk", "ac.uk", "com.au", "net.au", "co.jp", "co.nz", "com.br", "co.in", "github.io",
+           "herokuapp.com", "vercel.app", "netlify.app", "pages.dev", "workers.dev", "appspot.com", "blogspot.com",
+           "azurewebsites.net", "cloudfront.net", "amazonaws.com", "firebaseapp.com", "web.app"}
 _FREE_MAIL = {"gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com", "yahoo.com", "icloud.com",
               "me.com", "aol.com", "proton.me", "protonmail.com", "gmx.com", "gmx.net", "mail.com", "yandex.com"}
 _MAX_WAIT_S = 120
@@ -57,10 +63,11 @@ def _flat(text: str) -> str:
     return re.sub(r"\s+", " ", text)
 
 
-def _near_keywords(text: str) -> Tuple[Optional[str], Optional[str]]:
+def _near_keywords(text: str, years: bool) -> Tuple[Optional[str], Optional[str]]:
     """``(after, before)``: the number closest after a word that names a code (within 80 characters), and the first
-    number shortly before one (within 40: "123456 is your code")."""
+    number shortly before one (within 40: "123456 is your code"). ``years=False`` passes over 19xx/20xx."""
     numbers = [(m.start(), m.end(), re.sub(r"[ -]", "", m.group(1))) for m in _CODE.finditer(text)]
+    numbers = [t for t in numbers if years or not _YEAR.fullmatch(t[2])]
     after, before, best = None, None, _NEAR + 1
     for kw in _KEYWORDS.finditer(text):
         for start, end, n in numbers:
@@ -74,15 +81,16 @@ def _near_keywords(text: str) -> Tuple[Optional[str], Optional[str]]:
 def extract_code(subject: str, body: str) -> Optional[str]:
     """The one code this message is about, or None when there is none or it is unclear.
 
-    The number closest after a word that names a code ("code", "verification", "one-time", ...) wins, subject first;
-    else a number just before such a word; else, when the subject names a code, the body's only 6-8 digit number. A
-    message with no such word yields nothing (a welcome mail's member number is not a code). Split codes ("123 456")
-    come back joined."""
+    The subject first, then the body: in each, the number closest after a word that names a code ("code",
+    "verification", "one-time", ...), else one just before such a word. A year (19xx/20xx, a footer's "(c)2026") counts
+    only when nothing else does. Else, when the subject names a code, the body's only 6-8 digit number. A message
+    with no such word yields nothing (a welcome mail's member number is not a code). Split codes come back joined."""
     subject, body = _flat(subject or ""), _flat(body or "")
-    (s_after, s_before), (b_after, b_before) = _near_keywords(subject), _near_keywords(body)
-    found = s_after or b_after or s_before or b_before
-    if found:
-        return found
+    for years in (False, True):
+        for text in (subject, body):
+            after, before = _near_keywords(text, years)
+            if after or before:
+                return after or before
     if _KEYWORDS.search(subject):
         bare = {re.sub(r"[ -]", "", m.group(1)) for m in _CODE.finditer(body)}
         bare = {n for n in bare if len(n) >= 6}
@@ -94,7 +102,9 @@ def extract_code(subject: str, body: str) -> Optional[str]:
 def sender_ok(sender: str) -> bool:
     """A sender narrow enough to name one site: an address, or a domain of two labels or more that is not free mail."""
     sender = sender.strip().lower()
-    return "@" in sender or (sender.count(".") >= 1 and sender not in _FREE_MAIL and not sender.startswith("."))
+    if "@" in sender:
+        return bool(_EMAIL.fullmatch(sender))
+    return bool(re.fullmatch(r"[a-z0-9-]+(\.[a-z0-9-]+)+", sender)) and sender not in _FREE_MAIL | _SHARED
 
 
 def from_matches(frm: str, sender: str) -> bool:
@@ -119,11 +129,11 @@ def _get(url: str, headers: dict, body: Optional[dict] = None, context=None) -> 
     return json.loads(urllib.request.urlopen(req, context=context, timeout=30).read())
 
 
-def _jmap_inbox(address: str, secret_file: str, base: str, sender: str) -> Tuple[Callable, Callable]:
+def _jmap_inbox(address: str, secret_file: str, base: str) -> Tuple[Callable, Callable]:
     """``(messages(since), wait(seconds))`` for a JMAP account. ``wait`` returns when the server pushes a change
     (the session's EventSource, on the same loopback base) or the time is up."""
     raw = open(secret_file, encoding="utf-8").read().strip()
-    if "@" not in raw.partition(":")[0]:  # the password alone (it may hold a colon itself)
+    if not _EMAIL.fullmatch(raw.partition(":")[0]):  # the password alone (it may hold a colon or an @ itself)
         raw = f"{address}:{raw}"
     headers = {"Authorization": "Basic " + base64.b64encode(raw.encode()).decode()}
     ctx = ssl._create_unverified_context() if urllib.parse.urlsplit(base).hostname in ("127.0.0.1", "localhost") else None
@@ -152,13 +162,12 @@ def _jmap_inbox(address: str, secret_file: str, base: str, sender: str) -> Tuple
             pass
         return False
 
-    return (lambda since: _jmap_query(base, headers, ctx, account, using, outgoing, since, sender)), wait
+    return (lambda since: _jmap_query(base, headers, ctx, account, using, outgoing, since)), wait
 
 
-def _jmap_query(base: str, headers: dict, ctx, account: str, using: dict, outgoing: list, since: float,
-                sender: str) -> Iterable[tuple]:
+def _jmap_query(base: str, headers: dict, ctx, account: str, using: dict, outgoing: list, since: float) -> Iterable[tuple]:
     after = datetime.fromtimestamp(since, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    match = {"after": after, "inMailboxOtherThan": outgoing, "from": sender}  # the server narrows, from_matches decides
+    match = {"after": after, "inMailboxOtherThan": outgoing}  # from_matches decides the sender (subdomains too)
     calls = [["Email/query", {"accountId": account, "filter": match,
                               "sort": [{"property": "receivedAt", "isAscending": False}], "limit": 20}, "q"],
              ["Email/get", {"accountId": account, "#ids": {"resultOf": "q", "name": "Email/query", "path": "/ids"},
@@ -236,7 +245,7 @@ def main(argv: List[str]) -> int:
                                        "(not a bare suffix or a free-mail domain)"}))
             return 1
         if address in jmap:
-            messages, wait = _jmap_inbox(address, jmap[address], args.jmap_url.rstrip("/"), sender)
+            messages, wait = _jmap_inbox(address, jmap[address], args.jmap_url.rstrip("/"))
         elif address in agentmail:
             messages, wait = _agentmail_inbox(address, agentmail[address], sender)
         else:

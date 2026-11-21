@@ -47,7 +47,7 @@ def _list(value: Any) -> List[str]:
 
 def own_inbox_addresses(cfg: Optional[Dict[str, Any]] = None) -> List[str]:
     cfg = own_inbox_config() if cfg is None else cfg
-    if not _list(cfg.get("reader")):
+    if not isinstance(cfg.get("reader"), list) or not cfg.get("reader"):  # an argv list; one string is not a command
         return []
     return [a.lower() for a in _list(cfg.get("addresses"))]
 
