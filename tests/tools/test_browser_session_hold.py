@@ -37,13 +37,12 @@ def test_held_session_outlives_the_inactivity_timeout_and_its_daemon_is_kept_awa
 
     closed, pinged = [], []
 
-    def agent_browser(key, command, args=None, timeout=None):  # the external CLI
+    def agent_browser(key, info, cmd_parts, command, *_):  # the external CLI process
         (closed if command == "close" else pinged).append(key)
-        if command != "close":
-            bt._session_last_activity[key] = time.time()
         return {"success": True, "data": {}}
 
-    with patch("tools.browser_tool_session._run_browser_command", side_effect=agent_browser), \
+    with patch("tools.browser_tool_session._browser_command_preflight", return_value={"browser_cmd": "agent-browser"}), \
+         patch("tools.browser_tool_session._spawn_and_collect", side_effect=agent_browser), \
          patch("tools.browser_tool._maybe_stop_recording"):
         with lifecycle.hold_browser_session("held"):
             lifecycle._cleanup_inactive_browser_sessions()
@@ -58,7 +57,8 @@ def test_held_session_outlives_the_inactivity_timeout_and_its_daemon_is_kept_awa
 
 
 def test_a_hold_never_relaunches_a_session_that_is_already_gone(tracking):
-    with patch("tools.browser_tool_session._run_browser_command") as agent_browser:
+    with patch("tools.browser_tool_session._browser_command_preflight", return_value={"browser_cmd": "agent-browser"}), \
+         patch("tools.browser_tool_session._spawn_and_collect") as agent_browser:
         with lifecycle.hold_browser_session("gone"):
             lifecycle._keep_held_sessions_alive()
     agent_browser.assert_not_called()

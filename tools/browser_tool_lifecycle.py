@@ -161,6 +161,10 @@ def _cleanup_inactive_browser_sessions():
                                and task_id not in _bt._session_holds]
 
     for task_id in sessions_to_cleanup:
+        with _bt._cleanup_lock:  # a hold taken (or a command run) since the snapshot keeps the session
+            if task_id in _bt._session_holds or time.time() - _bt._session_last_activity.get(task_id, 0) \
+                    <= _bt.BROWSER_SESSION_INACTIVITY_TIMEOUT:
+                continue
         elapsed = int(current_time - _bt._session_last_activity.get(task_id, current_time))
         _bt.logger.info("Cleaning up inactive session for task: %s (inactive for %ss)", task_id, elapsed)
         try:
@@ -185,6 +189,9 @@ def _cleanup_inactive_browser_sessions():
                 _forget_session_tracking(task_id, activity=False)
 
 
+_keepalive_lock = threading.Lock()  # one keepalive round at a time; a released hold waits out its in-flight ping
+
+
 @contextlib.contextmanager
 def hold_browser_session(task_id: str):
     """Keep session ``task_id``'s browser open while a tool waits on the user. A vault prompt (a one-time
@@ -201,20 +208,45 @@ def hold_browser_session(task_id: str):
                 _bt._session_holds[task_id] = left
             else:
                 _bt._session_holds.pop(task_id, None)
+        with _keepalive_lock:  # a ping still running for it ends before the caller may close the browser
+            pass
+
+
+def _daemon_idle_s() -> float:
+    """Seconds the agent-browser daemon idles before it quits: the inactivity timeout, unless the user set
+    ``AGENT_BROWSER_IDLE_TIMEOUT_MS`` themselves (``_agent_browser_command_env`` passes theirs through)."""
+    idle = float(_bt.BROWSER_SESSION_INACTIVITY_TIMEOUT)
+    with contextlib.suppress(TypeError, ValueError):
+        idle = min(idle, float(_bt._build_browser_env().get("AGENT_BROWSER_IDLE_TIMEOUT_MS") or "inf") / 1000)
+    return max(idle, 3.0)
 
 
 def _keep_held_sessions_alive() -> None:
     """Reset the agent-browser daemon's own idle clock for held sessions. A browser launched with ``--session``
-    (no ``cdp_url``) belongs to the daemon, which quits after ``AGENT_BROWSER_IDLE_TIMEOUT_MS`` without a
-    command and takes the browser with it; the supervisor's CDP traffic does not count. Pinged at a third of
-    the timeout so a held browser never gets near it."""
-    due = time.time() - _bt.BROWSER_SESSION_INACTIVITY_TIMEOUT / 3
-    with _bt._cleanup_lock:  # a session that is gone is not re-created here: the ping would launch a blank browser
-        keys = [key for key in _bt._session_holds if key in _bt._active_sessions
+    (no ``cdp_url``) belongs to the daemon, which quits after its idle timeout without a command and takes the
+    browser with it; the supervisor's CDP traffic does not count. Pinged at a third of that timeout. The ping goes
+    to the session record taken here, never through ``_get_session_info``: a session closed meanwhile is not
+    re-created as a blank browser."""
+    if not _bt._session_holds:
+        return
+    with _keepalive_lock:
+        _ping_held_sessions(time.time() - _daemon_idle_s() / 3)
+
+
+def _ping_held_sessions(due: float) -> None:
+    with _bt._cleanup_lock:
+        held = [(key, _bt._active_sessions[key]) for key in _bt._session_holds if key in _bt._active_sessions
                 and not _bt._active_sessions[key].get("cdp_url") and _bt._session_last_activity.get(key, 0) < due]
-    for key in keys:
+    for key, info in held:
+        if key not in _bt._session_holds:  # released while an earlier key was pinged
+            continue
+        preflight = _session._browser_command_preflight()
+        if "browser_cmd" not in preflight:
+            return
+        _update_session_activity(key)  # the daemon's clock restarts when the ping arrives, not when it returns
         with _session_owner_scope(key):
-            res = _session._run_browser_command(key, "get", ["cdp-url"])
+            _, res = _session._dispatch_browser_command(key, info, preflight["browser_cmd"], "get", ["cdp-url"],
+                                                        _bt._safe_command_timeout(), None)
         if not res.get("success"):
             _bt.logger.warning("Could not keep held browser session %s alive: %s", key, res.get("error"))
 
