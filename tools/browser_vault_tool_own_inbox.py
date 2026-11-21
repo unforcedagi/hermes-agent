@@ -8,9 +8,9 @@ reaches the tool result, a log line or the transcript. Limits, all enforced here
 - only the inboxes listed in ``vault.own_inbox.addresses`` (the reader refuses any inbox it holds no key for);
 - only the NEWEST message holding a code, received in the last 10 minutes, and each code at most once per process
   (a used code means "wait for the next mail", never "fall back to an older one" a resend has replaced);
+- the agent names the ``sender`` (part of the From address), so another site's newer code is never the one typed;
 - the page's origin must be bound to the saved login, listed in ``vault.own_inbox.origins``, or named by the agent
-  in the call (``site``, together with the ``sender`` whose mail it is); every attempt writes one audit line with
-  the origin and which of the three allowed it.
+  in the call (``site``); every attempt writes one audit line with the origin and which of the three allowed it.
 """
 
 from __future__ import annotations
@@ -44,10 +44,9 @@ def own_inbox_addresses(cfg: Optional[Dict[str, Any]] = None) -> List[str]:
     return [str(a).strip().lower() for a in (cfg.get("addresses") or []) if str(a).strip()]
 
 
-def origin_basis(origin: str, item_origins: List[str], site: str, sender: str, cfg: Dict[str, Any]) -> Optional[str]:
+def origin_basis(origin: str, item_origins: List[str], site: str, cfg: Dict[str, Any]) -> Optional[str]:
     """Why ``origin`` may take a code from the agent's inbox: ``item`` (the saved login is bound to it), ``config``
-    (``vault.own_inbox.origins``) or ``named`` (the agent named this exact origin in the call, and the sender whose
-    mail holds its code, so the newest code from some other site is never the one typed); None = refused."""
+    (``vault.own_inbox.origins``) or ``named`` (the agent named this exact origin in the call); None = refused."""
     from agent.vault_store import normalize_origin
 
     def norm(value: str) -> str:
@@ -60,7 +59,7 @@ def origin_basis(origin: str, item_origins: List[str], site: str, sender: str, c
         return "item"
     if origin in {norm(str(o)) for o in (cfg.get("origins") or [])}:
         return "config"
-    if site and norm(site) == origin and sender.strip():
+    if site and norm(site) == origin:
         return "named"
     return None
 
@@ -123,9 +122,9 @@ OWN_INBOX_PROPERTIES = {
                                "never see it. Never use it for the user's accounts: their codes come from them (omit "
                                "source).")},
     "inbox": {"type": "string", "description": "Which of your own inboxes the code went to. Default: the first one."},
-    "sender": {"type": "string", "description": "Part of the sender's address (e.g. the site's domain), to pick its mail."},
+    "sender": {"type": "string", "description": ("Required with own_inbox: part of the sender's address (usually the "
+                                                 "site's domain), so only that site's mail is read.")},
     "site": {"type": "string", "description": ("The site's origin (https://host) when no saved login is bound to it: you "
-                                               "vouch the code is for this exact site (pass sender too), and the call "
-                                               "is audited.")},
+                                               "vouch the code is for this exact site, and the call is audited.")},
     "wait_s": {"type": "integer", "description": f"Seconds to wait for the mail to arrive (default 60, max {_MAX_WAIT_S})."},
 }

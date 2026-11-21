@@ -51,6 +51,12 @@ def test_held_session_outlives_the_inactivity_timeout_and_its_daemon_is_kept_awa
         assert closed == ["idle"] and pinged == ["held"]
         assert "held" in bt._active_sessions
 
+        bt._session_last_activity["held"] = stale
+        with lifecycle.hold_browser_session("held"):  # a cloud/CDP session is never pinged: its stamp stays old
+            pass
+        lifecycle._cleanup_inactive_browser_sessions()  # the release restarts the clock: no teardown right after
+        assert closed == ["idle"]
+
         bt._session_last_activity["held"] = stale  # released: an ordinary idle session again
         lifecycle._cleanup_inactive_browser_sessions()
         assert closed == ["idle", "held"]

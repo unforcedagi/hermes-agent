@@ -31,8 +31,8 @@ from datetime import datetime, timezone
 from typing import Iterable, List, Optional
 
 MAX_AGE_S = 600  # a hard ceiling: older mail never yields a code, whatever the request says
-_KEYWORDS = re.compile(r"\b(?:code|passcode|verification|verify|one[- ]time|otp|pin|security|sign[- ]?in|log[- ]?in|confirm)",
-                       re.IGNORECASE)
+# Words that name a code. Not "sign in" / "security" / "confirm": a sign-in alert's date or a user number follows those.
+_KEYWORDS = re.compile(r"\b(?:code|passcode|verification|one[- ]time|otp|pin)\b", re.IGNORECASE)
 # 4-8 digits, or 3+3 / 4+4 split by a space or dash; never part of a longer token, URL, date, time or price.
 _CODE = re.compile(r"(?<![\w/#.$€£:-])(\d{3,4}[ -]\d{3,4}|\d{4,8})(?![\w/%:-]|\.\d)")
 _NEAR = 80  # characters after a keyword that still count as "the code it names"
@@ -72,7 +72,7 @@ def _get(url: str, headers: dict, body: Optional[dict] = None, context=None) -> 
 
 def _jmap_messages(address: str, secret_file: str, base: str, since: float) -> Iterable[tuple]:
     raw = open(secret_file, encoding="utf-8").read().strip()
-    if ":" not in raw:
+    if "@" not in raw.partition(":")[0]:  # a bare password (it may hold a colon itself)
         raw = f"{address}:{raw}"
     headers = {"Authorization": "Basic " + base64.b64encode(raw.encode()).decode()}
     ctx = ssl._create_unverified_context() if urllib.parse.urlsplit(base).hostname in ("127.0.0.1", "localhost") else None
@@ -99,10 +99,11 @@ def _jmap_messages(address: str, secret_file: str, base: str, since: float) -> I
 
 def _agentmail_messages(address: str, curl_config: str, since: float, sender: str) -> Iterable[tuple]:
     """Newest first (the API's order); a message body is fetched only for mail that can match."""
-    m = re.search(r'header\s*=?\s*"([^":]+):\s*([^"]+)"', open(curl_config, encoding="utf-8").read())
+    m = re.search(r'(?:header\s*=?|-H)\s*"(Authorization):\s*([^"]+)"', open(curl_config, encoding="utf-8").read(),
+                  re.IGNORECASE)
     if not m:
         raise ValueError("no Authorization header in the AgentMail curl config")
-    headers = {m.group(1): m.group(2).strip()}
+    headers = {"Authorization": m.group(2).strip()}
     inbox = "https://api.agentmail.to/v0/inboxes/" + urllib.parse.quote(address, safe="@")
     for msg in _get(inbox + "/messages?limit=20", headers).get("messages", []):
         at = _epoch(msg.get("timestamp") or msg["created_at"])

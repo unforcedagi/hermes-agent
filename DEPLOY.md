@@ -18,7 +18,8 @@ Nothing live changes until Uni merges and the gateway restarts.
    (plus `inbox`, `sender`, `site`, `wait_s`). Hermes runs the configured reader, takes the newest unused code from
    the last 10 minutes and types it over the supervisor socket. The model sees only "entered" / "no code found";
    the code is not in argv, tool output, logs or the session DB. Limits: only `vault.own_inbox.addresses`; the
-   reader opens only the inboxes named on its own command line; the page origin must be bound to the saved login,
+   reader opens only the inboxes named on its own command line; the call names the `sender` (so another site's
+   newer code is never read); a used code means "wait for the next mail"; the page origin must be bound to the saved login,
    listed in `vault.own_inbox.origins`, or named in the call (`site`). Every attempt writes one
    `AUDIT vault own-inbox code <outcome>: origin=… basis=item|config|named inbox=… sender=…` line to `agent.log`.
    With no `vault.own_inbox` config the schema is unchanged.

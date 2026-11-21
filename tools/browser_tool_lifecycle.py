@@ -189,7 +189,9 @@ def _cleanup_inactive_browser_sessions():
                 _forget_session_tracking(task_id, activity=False)
 
 
-_keepalive_lock = threading.Lock()  # one keepalive round at a time; a released hold waits out its in-flight ping
+_keepalive_lock = threading.Lock()  # one keepalive round at a time
+_pinging = threading.Condition()  # guards _pinging_key: a released hold waits out ITS in-flight ping only
+_pinging_key: Optional[str] = None
 
 
 @contextlib.contextmanager
@@ -208,8 +210,10 @@ def hold_browser_session(task_id: str):
                 _bt._session_holds[task_id] = left
             else:
                 _bt._session_holds.pop(task_id, None)
-        with _keepalive_lock:  # a ping still running for it ends before the caller may close the browser
-            pass
+            if task_id in _bt._active_sessions:  # the wait counts as use: the janitor starts its clock now
+                _bt._session_last_activity[task_id] = time.time()
+        with _pinging:  # a ping still running for it ends before the caller may close the browser
+            _pinging.wait_for(lambda: _pinging_key != task_id)
 
 
 def _daemon_idle_s() -> float:
@@ -234,19 +238,28 @@ def _keep_held_sessions_alive() -> None:
 
 
 def _ping_held_sessions(due: float) -> None:
+    global _pinging_key
     with _bt._cleanup_lock:
-        held = [(key, _bt._active_sessions[key]) for key in _bt._session_holds if key in _bt._active_sessions
+        held = [key for key in _bt._session_holds if key in _bt._active_sessions
                 and not _bt._active_sessions[key].get("cdp_url") and _bt._session_last_activity.get(key, 0) < due]
-    for key, info in held:
-        if key not in _bt._session_holds:  # released while an earlier key was pinged
-            continue
-        preflight = _session._browser_command_preflight()
-        if "browser_cmd" not in preflight:
-            return
-        _update_session_activity(key)  # the daemon's clock restarts when the ping arrives, not when it returns
-        with _session_owner_scope(key):
-            _, res = _session._dispatch_browser_command(key, info, preflight["browser_cmd"], "get", ["cdp-url"],
-                                                        _bt._safe_command_timeout(), None)
+    preflight = _session._browser_command_preflight() if held else {}
+    if "browser_cmd" not in preflight:
+        return
+    for key in held:
+        with _pinging, _bt._cleanup_lock:  # still held and still open (released or closed since the snapshot: skip)
+            info = _bt._active_sessions.get(key) if key in _bt._session_holds else None
+            if info is None:
+                continue
+            _pinging_key = key
+            _bt._session_last_activity[key] = time.time()  # the daemon's clock restarts when the ping arrives
+        try:
+            with _session_owner_scope(key):
+                _, res = _session._dispatch_browser_command(key, info, preflight["browser_cmd"], "get", ["cdp-url"],
+                                                            _bt._safe_command_timeout(), None)
+        finally:
+            with _pinging:
+                _pinging_key = None
+                _pinging.notify_all()
         if not res.get("success"):
             _bt.logger.warning("Could not keep held browser session %s alive: %s", key, res.get("error"))
 

@@ -510,13 +510,16 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, se
                 f"{inbox or 'No inbox'} is not one of your own inboxes (vault.own_inbox.addresses: "
                 f"{', '.join(addresses) or 'none configured'}). Codes for the user's accounts come from the user: "
                 "call again without source.")})
-        basis = own.origin_basis(origin, allowed, named_site, sender, own_cfg)
+        if not sender.strip():
+            return json.dumps({"success": False, "error_type": "sender_required", "error": (
+                "Pass sender=<part of the sender's address, usually the site's domain> so only that site's mail is "
+                "read. Nothing was read.")})
+        basis = own.origin_basis(origin, allowed, named_site, own_cfg)
         if basis is None:
             own.audit("refused", origin, None, inbox, sender)
             return json.dumps({"success": False, "error_type": "origin_not_allowed", "error": (
                 f"Refused: {origin} is not bound to a saved login or listed in vault.own_inbox.origins. If this code "
-                "is for this exact site, name it with site=<its origin> and sender=<part of the sender's address>; the "
-                "call is audited. Nothing was read.")})
+                "is for this exact site, name it with site=<its origin>; the call is audited. Nothing was read.")})
 
     nonce = secrets.token_hex(8)
     inspect = _eval_js(effective_task_id, build_inspection_js(nonce))

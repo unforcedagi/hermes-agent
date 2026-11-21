@@ -120,9 +120,9 @@ def test_origin_without_basis_is_refused_before_any_mail_is_read(mailbox, caplog
     mailbox.messages = [{"from": "x@evil.test", "subject": "code", "body": "Your code is 654321", "at": time.time()}]
     with caplog.at_level(logging.INFO, logger=own.__name__):
         out, _, typed = _enter(page_origin="https://evil.test", site="https://acme.test", sender="evil.test")
-        unsent, _, _ = _enter(site="https://acme.test")  # naming the site needs the sender too
+        unsent, _, _ = _enter(site="https://acme.test")  # no sender: another site's newer code could be the one read
     assert out["error_type"] == "origin_not_allowed" and typed == [] and mailbox.requests == 0
-    assert unsent["error_type"] == "origin_not_allowed"
+    assert unsent["error_type"] == "sender_required"
     assert "refused: origin=https://evil.test" in caplog.text
 
     other, _, _ = _enter(inbox="someone-else@inbox.test", site="https://acme.test", sender="acme.test")  # not one of the agent's inboxes
@@ -146,7 +146,9 @@ def test_reader_refuses_an_inbox_it_holds_no_key_for(mailbox):
     ("Hello", "Your account number is 998877.", "998877"),     # one bare 6-digit number: it is the code
     ("Hello", "Call 555 0100 or 555 0199 about 301122 or 301133", None),  # ambiguous: no code
     ("Receipt", "Total 2026 items, ref 12", None),
-    ("Hi", "Please verify " + "x" * 66 + " ref 4815162342", None),  # a long number across the window is not a code
+    ("Hi", "Your code is ready " + "x" * 66 + " ref 4815162342", None),  # a long number across the window is not a code
+    ("New sign-in to your account", "We noticed a sign in on Nov 21, 2026 from Chrome. Your verification code is 482913.", "482913"),
+    ("Welcome", "Thanks for signing up, Pinterest user 1234! Your code: 482913", "482913"),
 ])
 def test_code_extraction(subject, body, code):
     assert _reader_module().extract_code(subject, body) == code
