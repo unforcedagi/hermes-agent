@@ -1,25 +1,31 @@
 #!/usr/bin/env python3
-"""Read the newest one-time codes from the agent's OWN mailboxes, for browser_vault_enter_code(source="own_inbox").
+"""Read the newest one-time code from the agent's OWN mailboxes, for browser_vault_enter_code(source="own_inbox").
 
-Hermes runs this as the ``vault.own_inbox.reader`` command (usually through ``sudo -n python3 -I``, since mailbox
-credentials are root-only). The inboxes it may read are named on its own command line, each with the credential
-that opens it; any other address is refused, whatever Hermes asks for:
+Runs as a socket-activated service (systemd ``Accept=yes``: one process per connection, the connection on stdin and
+stdout), as its own service user, never as the agent's user and never as root. Hermes connects to the unix socket and
+sends one request line; this answers with one reply line. The inboxes it may read are fixed on its own command line,
+each with the credential that opens it, by whoever installed the service; any other address is refused before any
+mail server is contacted, whatever the request says:
 
-  own_inbox_code.py --jmap ADDRESS=SECRET_FILE [--jmap-url URL] --agentmail ADDRESS=CURL_CONFIG
+  own_inbox_code.py --peer-uid UID --jmap ADDRESS=SECRET_FILE [--jmap-url URL] --agentmail ADDRESS=CURL_CONFIG
 
-  --jmap       a JMAP server account (Stalwart): SECRET_FILE holds the password, or "login@domain:password".
+  --peer-uid   the only uid that may ask (checked with SO_PEERCRED on the connection); anyone else is refused.
+  --jmap       a JMAP server account (Stalwart): SECRET_FILE holds its password, or "login@domain:password" for a
+               login of the reader's own that ADDRESS shares its Inbox with read-only (the least it needs: such a
+               login can open nothing else). Only the account named ADDRESS is ever queried.
   --agentmail  an AgentMail inbox: CURL_CONFIG is a curl config with the API's Authorization header.
 
-Request on stdin: {"address": "...", "sender": "acme.com | no-reply@acme.com", "max_age_s": 600, "wait_s": 60,
-                   "skip": ["<sha256 of a code already used>", ...]}
-  sender: a domain (two labels at least, not a free-mail one) matches mail From that domain or its subdomains;
-  an address matches only itself. Only the From address counts, never its display name.
+Request, one JSON line: {"address": "...", "sender": "acme.com | no-reply@acme.com", "max_age_s": 600,
+                         "wait_s": 60, "skip": ["<sha256 of a code already used>", ...]}
+  No other key is accepted. sender: a domain (two labels at least, not a free-mail one) matches mail From that domain
+  or its subdomains; an address matches only itself. Only the From address counts, never its display name.
   The newest message from the sender holding a code is the answer. If its code is in ``skip`` (or there is none yet),
   the reader waits up to ``wait_s`` for new mail (JMAP: the server's push stream; AgentMail: every 5 s); it never
   falls back to an older message, whose code a resend has replaced.
-Reply on stdout:  {"candidates": [{"code": "...", "received_at": <epoch>, "from": "..."}]} (at most one), or
-                  {"error": "..."} with exit status 1. Nothing else is ever printed: no body, link or subject.
-Stdlib only, so it runs under ``python3 -I``.
+Reply, one JSON line: {"candidates": [{"code": "...", "received_at": <epoch>, "from": "..."}]} (at most one), or
+                      {"error": "..."}. Nothing else is ever sent: no body, link or subject.
+Each request writes one audit line to stderr (the journal): who asked, which inbox and sender, and the outcome. Never
+the code. Stdlib only, so it runs under ``python3 -I``.
 """
 from __future__ import annotations
 
@@ -29,8 +35,11 @@ import email.utils
 import hashlib
 import html
 import json
+import os
 import re
+import socket
 import ssl
+import struct
 import sys
 import time
 import urllib.parse
@@ -54,6 +63,9 @@ _SHARED = {"co.uk", "org.uk", "ac.uk", "com.au", "net.au", "co.jp", "co.nz", "co
 _FREE_MAIL = {"gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com", "yahoo.com", "icloud.com",
               "me.com", "aol.com", "proton.me", "protonmail.com", "gmx.com", "gmx.net", "mail.com", "yandex.com"}
 _MAX_WAIT_S = 120
+_MAX_REQUEST = 32768  # bytes in the one request line
+_FIELDS = {"address", "sender", "max_age_s", "wait_s", "skip"}
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 def _flat(text: str) -> str:
@@ -130,21 +142,27 @@ def _get(url: str, headers: dict, body: Optional[dict] = None, context=None) -> 
 
 
 def _jmap_inbox(address: str, secret_file: str, base: str, sender: str) -> Tuple[Callable, Callable]:
-    """``(messages(since), wait(seconds))`` for a JMAP account. ``wait`` returns when the server pushes a change
-    (the session's EventSource, on the same loopback base) or the time is up."""
+    """``(messages(since), wait(seconds))`` for the JMAP account named ``address``. SECRET_FILE holds that account's
+    password, or ``login@domain:password`` for a login of its own that ``address`` shares its Inbox with (read-only).
+    Only the account named ``address`` is ever queried, whatever else the login can see. ``wait`` returns when the
+    server pushes a change (the session's EventSource, on the same loopback base) or the time is up; a shared mailbox
+    gets no push from the server, so there it is a 5 s pause."""
     raw = open(secret_file, encoding="utf-8").read().strip()
     login, colon, _ = raw.partition(":")
     if not (colon and _EMAIL.fullmatch(login)):  # the password alone (it may hold an @ or a colon itself)
-        raw = f"{address}:{raw}"
+        login, raw = address, f"{address}:{raw}"
     headers = {"Authorization": "Basic " + base64.b64encode(raw.encode()).decode()}
     ctx = ssl._create_unverified_context() if urllib.parse.urlsplit(base).hostname in ("127.0.0.1", "localhost") else None
     session = _get(base + "/jmap/session", headers, context=ctx)
-    account = session["primaryAccounts"]["urn:ietf:params:jmap:mail"]
+    account = next((aid for aid, a in (session.get("accounts") or {}).items()
+                    if str(a.get("name") or "").lower() == address), None)
+    if account is None:
+        raise LookupError("this reader's login sees no account by that name")
     using = {"using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"]}
     boxes = _get(base + "/jmap/", headers, {**using, "methodCalls": [["Mailbox/get", {"accountId": account,
                  "properties": ["role"]}, "m"]]}, context=ctx)["methodResponses"][0][1]["list"]
     outgoing = [b["id"] for b in boxes if b.get("role") in ("sent", "drafts", "trash")]  # mail the agent wrote or binned
-    push = session.get("eventSourceUrl") or ""
+    push = (session.get("eventSourceUrl") or "") if login.lower() == address else ""
     push = (base + urllib.parse.urlsplit(push).path + "?types=Email&closeafter=state&ping=0") if push else ""
 
     def wait(seconds: float) -> bool:
@@ -240,31 +258,74 @@ def _pairs(values: List[str], flag: str) -> dict:
     return out
 
 
-def main(argv: List[str]) -> int:
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--jmap", action="append", default=[])
-    ap.add_argument("--jmap-url", default="https://127.0.0.1:8480")
-    ap.add_argument("--agentmail", action="append", default=[])
-    args = ap.parse_args(argv)
-    jmap, agentmail = _pairs(args.jmap, "--jmap"), _pairs(args.agentmail, "--agentmail")
+def peer_uid(fd: int = 0) -> Optional[int]:
+    """The uid of the process on the other end of the unix socket on ``fd`` (SO_PEERCRED), or None when ``fd`` is
+    not a unix socket."""
     try:
-        req = json.loads(sys.stdin.read() or "{}")
-        address = str(req.get("address") or "").strip().lower()
-        sender = str(req.get("sender") or "").strip()
-        max_age = min(MAX_AGE_S, max(0, int(req.get("max_age_s") or MAX_AGE_S)))
-        deadline = time.monotonic() + min(_MAX_WAIT_S, max(0, int(req.get("wait_s") or 0)))
-        skip = {str(h) for h in (req.get("skip") or [])}
-        if not sender_ok(sender):
-            print(json.dumps({"error": "sender must be the address or the site's own domain the code comes from "
-                                       "(not a bare suffix or a free-mail domain)"}))
-            return 1
+        conn = socket.socket(fileno=os.dup(fd))
+    except OSError:
+        return None
+    with conn:
+        if conn.family != socket.AF_UNIX:
+            return None
+        _, uid, _ = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+        return uid
+
+
+def parse_request(line: bytes) -> dict:
+    """The one request shape, checked field by field; ValueError for anything else."""
+    if len(line) > _MAX_REQUEST:
+        raise ValueError("request too long")
+    req = json.loads(line or b"{}")
+    if not isinstance(req, dict) or set(req) - _FIELDS:
+        raise ValueError(f"a request holds only {', '.join(sorted(_FIELDS))}")
+    skip = req.get("skip") or []
+    if not isinstance(skip, list) or not all(isinstance(h, str) and _SHA256.fullmatch(h) for h in skip):
+        raise ValueError("skip is a list of sha256 hex digests")
+    return {"address": str(req.get("address") or "").strip().lower(), "sender": str(req.get("sender") or "").strip(),
+            "max_age_s": min(MAX_AGE_S, max(0, int(req.get("max_age_s") or MAX_AGE_S))),
+            "wait_s": min(_MAX_WAIT_S, max(0, int(req.get("wait_s") or 0))), "skip": set(skip)}
+
+
+def _audit(uid: Optional[int], address: str, sender: str, outcome: str) -> None:
+    """One journal line per request. Values are JSON-quoted, so a request cannot forge a second line."""
+    print(f"own-inbox-code audit: peer_uid={uid} address={json.dumps(address[:120])} "
+          f"sender={json.dumps(sender[:120])} outcome={outcome}", file=sys.stderr, flush=True)
+
+
+def _reply(obj: dict) -> int:
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+    return 0 if "candidates" in obj else 1
+
+
+def serve(args: argparse.Namespace, line: bytes, uid: Optional[int]) -> int:
+    """Answer one request: refusals first (wrong peer, malformed request, an inbox not on the command line, a vague
+    sender), each before any mail server is contacted; then the newest unused code from the sender, waiting for it."""
+    jmap, agentmail = _pairs(args.jmap, "--jmap"), _pairs(args.agentmail, "--agentmail")
+    if uid != args.peer_uid:
+        _audit(uid, "", "", "refused:peer")
+        return _reply({"error": "this reader answers only its own user"})
+    try:
+        req = parse_request(line)
+    except (ValueError, TypeError) as exc:
+        _audit(uid, "", "", "refused:request")
+        return _reply({"error": f"malformed request: {str(exc)[:200]}"})
+    address, sender = req["address"], req["sender"]
+    if address not in jmap and address not in agentmail:
+        _audit(uid, address, sender, "refused:inbox")
+        return _reply({"error": f"{address or 'no address'} is not one of this reader's inboxes"})
+    if not sender_ok(sender):
+        _audit(uid, address, sender, "refused:sender")
+        return _reply({"error": "sender must be the address or the site's own domain the code comes from "
+                                "(not a bare suffix or a free-mail domain)"})
+    max_age, skip = req["max_age_s"], req["skip"]
+    deadline = time.monotonic() + req["wait_s"]
+    try:
         if address in jmap:
             messages, wait = _jmap_inbox(address, jmap[address], args.jmap_url.rstrip("/"), sender)
-        elif address in agentmail:
-            messages, wait = _agentmail_inbox(address, agentmail[address], sender)
         else:
-            print(json.dumps({"error": f"{address or 'no address'} is not one of this reader's inboxes"}))
-            return 1
+            messages, wait = _agentmail_inbox(address, agentmail[address], sender)
         settle = 0  # after a push the new mail can take a moment to become searchable: a few quick re-queries
         while True:
             found = candidates(messages(time.time() - max_age), sender, time.time() - max_age)
@@ -279,10 +340,20 @@ def main(argv: List[str]) -> int:
             elif wait(min(left, 15.0)):  # a mail that lands before the stream connects costs 15 s at most
                 settle = 5
     except Exception as exc:  # the message never carries mail content: only the failure's kind and text
-        print(json.dumps({"error": f"{type(exc).__name__}: {re.sub(r'[0-9]{4,}', '[digits]', str(exc))[:200]}"}))
-        return 1
-    print(json.dumps({"candidates": found}))
-    return 0
+        _audit(uid, address, sender, f"error:{type(exc).__name__}")
+        return _reply({"error": f"{type(exc).__name__}: {re.sub(r'[0-9]{4,}', '[digits]', str(exc))[:200]}"})
+    _audit(uid, address, sender, "found" if found else "none")
+    return _reply({"candidates": found})
+
+
+def main(argv: List[str]) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--peer-uid", type=int, required=True)
+    ap.add_argument("--jmap", action="append", default=[])
+    ap.add_argument("--jmap-url", default="https://127.0.0.1:8480")
+    ap.add_argument("--agentmail", action="append", default=[])
+    args = ap.parse_args(argv)
+    return serve(args, sys.stdin.buffer.readline(_MAX_REQUEST + 1), peer_uid(0))
 
 
 if __name__ == "__main__":

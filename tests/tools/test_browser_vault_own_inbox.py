@@ -1,15 +1,22 @@
 """browser_vault_enter_code(source="own_inbox"): a code from the agent's own mailbox, entered unseen.
 
-The real reader (scripts/own_inbox_code.py) runs as a subprocess against a stand-in JMAP server (the mail server is
-the external system); the page is faked at the browser boundary like the other enter_code tests.
+The real reader (scripts/own_inbox_code.py) answers on a real unix socket the way systemd's Accept=yes runs it (one
+process per connection, the connection on stdin and stdout), against a stand-in JMAP server (the mail server is the
+external system); the page is faked at the browser boundary like the other enter_code tests.
 """
 
+import base64
 import http.server
 import importlib.util
 import json
 import logging
+import os
 import re
+import shutil
+import socket
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
@@ -33,27 +40,37 @@ def _reader_module():
     return mod
 
 
+OWNER = "owner@inbox.test"
+
+
 class _Mailbox:
-    """A JMAP server holding a few messages; it ignores the query's date filter, so the reader must apply it."""
+    """A JMAP server holding a few messages; it ignores the query's date filter, so the reader must apply it. Like the
+    live server, the agent's login also sees the owner's account through a share (a2), whose newest mail holds a
+    code: the reader must never ask for it. Every accountId the reader names is recorded in ``accounts_asked``."""
 
     def __init__(self):
-        self.messages, self.requests = [], 0
+        self.messages, self.requests, self.accounts_asked, self.logins = [], 0, set(), set()
         box = self
 
         class H(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
-                self._json({"primaryAccounts": {"urn:ietf:params:jmap:mail": "a1"}})
+                box.logins.add(base64.b64decode(self.headers["Authorization"].split()[1]).decode().split(":")[0])
+                self._json({"primaryAccounts": {"urn:ietf:params:jmap:mail": "a1"},
+                            "accounts": {"a1": {"name": INBOX}, "a2": {"name": OWNER}}})
 
             def do_POST(self):
                 box.requests += 1
                 calls = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))["methodCalls"]
+                box.accounts_asked |= {c[1].get("accountId") for c in calls}
                 if calls[0][0] == "Mailbox/get":
                     self._json({"methodResponses": [["Mailbox/get", {"list": [{"id": "i", "role": "inbox"}]}, "m"]]})
                     return
+                mine = box.messages if calls[0][1].get("accountId") == "a1" else [
+                    {"from": "no-reply@acme.test", "subject": "Code", "body": "Your code is 999111", "at": time.time()}]
                 listed = [{"id": str(i), "from": [{"email": m["from"]}], "subject": m["subject"],
                            "receivedAt": datetime.fromtimestamp(m["at"], timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                            "textBody": [{"partId": "1"}], "bodyValues": {"1": {"value": m["body"]}}}
-                          for i, m in sorted(enumerate(box.messages), key=lambda im: -im[1]["at"])]  # newest first
+                          for i, m in sorted(enumerate(mine), key=lambda im: -im[1]["at"])]  # newest first
                 listed = listed[:calls[0][1].get("limit", 10**6)] if calls[0][0] == "Email/query" else listed
                 ids = calls[-1][1].get("ids")
                 if ids is not None:  # a body fetch for named messages
@@ -73,16 +90,59 @@ class _Mailbox:
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
 
 
+def _listen(handle):
+    """A unix socket served by ``handle(conn)`` per connection, as systemd's socket activation would; its path."""
+    path = os.path.join(tempfile.mkdtemp(prefix="oi"), "s")  # short: AF_UNIX paths stop at 107 bytes
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(path)
+    srv.listen(8)
+
+    def loop():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            with conn:
+                handle(conn)
+
+    threading.Thread(target=loop, daemon=True).start()
+    return path, srv
+
+
+def _reader_service(argv):
+    """Accept=yes: the real reader, one process per connection, the connection as its stdin and stdout."""
+    return _listen(lambda conn: subprocess.run([sys.executable, "-I", str(READER), *argv], stdin=conn.fileno(),
+                                               stdout=conn.fileno(), stderr=subprocess.DEVNULL, timeout=150))
+
+
+def _canned(reply):
+    """A stand-in reader that answers every request with ``reply``."""
+    def handle(conn):
+        conn.makefile("rb").readline()
+        conn.sendall(reply.encode() + b"\n")
+    return _listen(handle)
+
+
+def _ask_reader(path, request):
+    from tools.browser_vault_tool_own_inbox import _ask
+
+    return json.loads(_ask(path, json.dumps(request), 30))
+
+
 @pytest.fixture
 def mailbox(tmp_path, monkeypatch):
     box = _Mailbox()
     secret = tmp_path / "secret"
     secret.write_text("not-a-real-password", encoding="utf-8")
-    cfg = {"reader": [sys.executable, "-I", str(READER), "--jmap", f"{INBOX}={secret}", "--jmap-url", box.url],
-           "addresses": [INBOX], "origins": []}
+    box.argv = ["--jmap", f"{INBOX}={secret}", "--jmap-url", box.url]
+    path, srv = _reader_service(["--peer-uid", str(os.getuid()), *box.argv])
+    cfg = {"socket": path, "addresses": [INBOX], "origins": []}
     monkeypatch.setattr(own, "own_inbox_config", lambda: cfg)
     monkeypatch.setattr(own, "_used", set())
     yield box
+    srv.close()
+    shutil.rmtree(os.path.dirname(path), ignore_errors=True)
     box.server.shutdown()
 
 
@@ -126,6 +186,22 @@ def test_newest_fresh_code_is_entered_unseen_once_and_audited(mailbox, caplog):
     threading.Thread(target=resend, daemon=True).start()
     third, _, typed_third = _enter(site="https://acme.test", sender="acme.test", wait_s=20)  # waits for the resend
     assert third["success"] and typed_third == ["906144"]
+    assert mailbox.accounts_asked == {"a1"}  # the owner's shared account (newer code) was never queried
+
+
+def test_a_login_of_its_own_reads_only_the_named_inbox(mailbox, tmp_path):
+    """The reader's own login (``login:password``) that the agent's inbox is shared with: it queries only the account
+    named by the inbox, never the owner's, and logs in as itself."""
+    secret = tmp_path / "reader-login"
+    secret.write_text("reader@inbox.test:not-a-real-password", encoding="utf-8")
+    path, srv = _reader_service(["--peer-uid", str(os.getuid()), "--jmap", f"{INBOX}={secret}", "--jmap-url", mailbox.url])
+    try:
+        mailbox.messages = [{"from": "no-reply@acme.test", "subject": "Code", "body": "Your code is 318264", "at": time.time() - 30}]
+        reply = _ask_reader(path, {"address": INBOX, "sender": "acme.test"})
+    finally:
+        srv.close()
+    assert reply["candidates"][0]["code"] == "318264"
+    assert mailbox.accounts_asked == {"a1"} and mailbox.logins == {"reader@inbox.test"}
 
 
 def test_origin_without_basis_is_refused_before_any_mail_is_read(mailbox, caplog):
@@ -141,13 +217,31 @@ def test_origin_without_basis_is_refused_before_any_mail_is_read(mailbox, caplog
     assert other["error_type"] == "inbox_not_allowed" and mailbox.requests == 0
 
 
-def test_reader_refuses_an_inbox_it_holds_no_key_for(mailbox):
-    import subprocess
+@pytest.mark.parametrize("address", ["owner@inbox.test", "OWNER@inbox.test", "third@elsewhere.test", ""])
+def test_reader_refuses_an_inbox_it_holds_no_key_for(mailbox, address):
+    """The owner's address, a third one, any case: refused before the mail server is contacted at all."""
+    reply = _ask_reader(own.own_inbox_config()["socket"], {"address": address, "sender": "acme.test"})
+    assert "not one of this reader's inboxes" in reply["error"] and mailbox.requests == 0
 
-    cfg = own.own_inbox_config()
-    proc = subprocess.run(cfg["reader"], input=json.dumps({"address": "user@inbox.test", "sender": "acme.test"}), capture_output=True,
-                          text=True, timeout=30)
-    assert proc.returncode == 1 and "not one of this reader's inboxes" in proc.stdout and mailbox.requests == 0
+
+@pytest.mark.parametrize("request_", [
+    {"address": INBOX, "sender": "acme.test", "jmap_url": "https://evil.test"},  # no key but the five
+    {"address": INBOX, "sender": "acme.test", "skip": ["not-a-digest"]},
+])
+def test_reader_takes_only_its_one_request_shape(mailbox, request_):
+    reply = _ask_reader(own.own_inbox_config()["socket"], request_)
+    assert reply["error"].startswith("malformed request") and mailbox.requests == 0
+
+
+def test_reader_answers_only_its_own_user(mailbox):
+    """SO_PEERCRED: a connection from any other uid is refused, even for an inbox it holds."""
+    path, srv = _reader_service(["--peer-uid", str(os.getuid() + 1), *mailbox.argv])
+    try:
+        mailbox.messages = [{"from": "no-reply@acme.test", "subject": "Code", "body": "Your code is 482913", "at": time.time()}]
+        reply = _ask_reader(path, {"address": INBOX, "sender": "acme.test"})
+    finally:
+        srv.close()
+    assert reply == {"error": "this reader answers only its own user"} and mailbox.requests == 0
 
 
 @pytest.mark.parametrize("subject,body,code", [
@@ -175,7 +269,7 @@ def test_code_extraction(subject, body, code):
 
 def test_hermes_enforces_the_ten_minutes_whatever_the_reader_returns(mailbox, monkeypatch):
     stale = json.dumps({"candidates": [{"code": "246810", "received_at": time.time() - 900, "from": "a@acme.test"}]})
-    cfg = {**own.own_inbox_config(), "reader": [sys.executable, "-I", "-c", f"print({stale!r})"]}
+    cfg = {**own.own_inbox_config(), "socket": _canned(stale)[0]}
     monkeypatch.setattr(own, "own_inbox_config", lambda: cfg)
     out, _, typed = _enter(site="https://acme.test", sender="acme.test")
     assert out["error_type"] == "no_code_found" and typed == []
@@ -184,7 +278,7 @@ def test_hermes_enforces_the_ten_minutes_whatever_the_reader_returns(mailbox, mo
 @pytest.mark.parametrize("reply", ["null", "[1, 2]", '{"candidates": [{"code": "1234", "received_at": "yesterday"}]}', "not json",
                                    '{"candidates": [{"code": "None", "received_at": 9999999999}]}'])
 def test_a_malformed_reader_reply_is_a_clean_refusal(mailbox, monkeypatch, reply):
-    cfg = {**own.own_inbox_config(), "reader": [sys.executable, "-I", "-c", f"print({reply!r})"]}
+    cfg = {**own.own_inbox_config(), "socket": _canned(reply)[0]}
     monkeypatch.setattr(own, "own_inbox_config", lambda: cfg)
     out, _, typed = _enter(site="https://acme.test", sender="acme.test")
     assert out["error_type"] == "reader_failed" and typed == []

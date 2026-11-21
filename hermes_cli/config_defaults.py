@@ -2416,10 +2416,11 @@ DEFAULT_CONFIG = {
             "binary_path": "",      # absolute path to bw; empty = PATH.
         },
         # browser_vault_enter_code(source="own_inbox"): one-time codes sent to the AGENT'S OWN mailboxes, read by
-        # `reader` (argv; scripts/own_inbox_code.py names each inbox with its credential) and entered unseen. Only
-        # these addresses, only mail from the last 10 minutes. Empty = off, and the tool schema has no such source.
+        # the inbox reader service on `socket` (scripts/own_inbox_code.py, socket-activated under its own user; the
+        # service, not Hermes, holds each inbox's credential) and entered unseen. Only these addresses, only mail
+        # from the last 10 minutes. Empty = off, and the tool schema has no such source.
         "own_inbox": {
-            "reader": [],     # e.g. [sudo, -n, python3, -I, <repo>/scripts/own_inbox_code.py, --jmap, ADDR=SECRET_FILE]
+            "socket": "",     # the reader service's unix socket, e.g. /run/own-inbox-code.sock
             "addresses": [],  # the agent's own inboxes; never the user's
             "origins": [],    # sites that may always take such a code (others: a saved login's site, or named + audited)
         },

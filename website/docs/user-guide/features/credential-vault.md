@@ -50,7 +50,7 @@ Sites that ask for a code after the password are handled the same way:
 - **Code sent to the agent's own inbox** (an account the agent holds itself,
   signed up with its own address): with `vault.own_inbox` configured, the agent
   calls `browser_vault_enter_code` with `source: own_inbox` and the `sender`
-  (the domain the site mails from). Hermes runs your reader command, takes the
+  (the domain the site mails from). Hermes asks the inbox reader service, which takes the
   code in that sender's newest mail from the last 10 minutes (once, waiting for
   the mail if it has not arrived yet) and enters it; the agent sees only "entered" or "no code found". It works only
   for the listed addresses, and only on a site bound to a saved login, listed
@@ -58,13 +58,26 @@ Sites that ask for a code after the password are handled the same way:
   `AUDIT vault own-inbox code` line to `agent.log`). Never list your own
   mailbox here: these codes go to the agent without asking you.
 
+  The reader is `scripts/own_inbox_code.py`, run by your system's service manager
+  as a socket-activated service under a user of its own: it holds the mailbox
+  credentials (Hermes never does), names its inboxes on its own command line,
+  answers only Hermes's user (checked on the socket), and writes one audit line
+  per request to the journal. Give it a mail login of its own that can read
+  only the agent's Inbox where your mail server allows it. A systemd example
+  (`own-inbox-code.socket` with `Accept=yes`, `SocketUser=` Hermes's user,
+  `SocketMode=0600`; `own-inbox-code@.service` with `DynamicUser=yes`,
+  `StandardInput=socket`, `StandardOutput=socket` and `LoadCredential=` for each
+  credential):
+
+  ```ini
+  ExecStart=/usr/bin/python3 -I /usr/local/libexec/own-inbox-code --peer-uid <Hermes's uid> \
+      --jmap agent@example.com=%d/jmap --agentmail agent@agentmail.example=%d/agentmail
+  ```
+
   ```yaml
   vault:
     own_inbox:
-      # scripts/own_inbox_code.py: each inbox named with the credential that opens it
-      reader: [sudo, -n, python3, -I, /path/to/hermes-agent/scripts/own_inbox_code.py,
-               --jmap, "agent@example.com=/root-only/jmap-password-file",
-               --agentmail, "agent@agentmail.example=/path/to/agentmail-curl.cfg"]
+      socket: /run/own-inbox-code.sock   # the reader service's socket
       addresses: [agent@example.com, agent@agentmail.example]
       origins: []           # sites that may always take such a code
   ```

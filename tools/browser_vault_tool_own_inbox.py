@@ -1,11 +1,13 @@
 """browser_vault_enter_code(source="own_inbox"): a one-time code sent to the agent's OWN mailbox, entered unseen.
 
 The agent signs in to accounts that are its own (their codes go to its own inboxes, never the user's). The code is
-read by the configured reader command (``scripts/own_inbox_code.py``: the request goes in on stdin, the code comes
-back on stdout, nothing in argv), typed into the page over the supervisor socket like every vault secret, and never
-reaches the tool result, a log line or the transcript. Limits, all enforced here:
+read by the inbox reader service (``scripts/own_inbox_code.py``, installed by the machine's admin as a socket-activated
+service under its own user, holding the mailbox credentials Hermes never sees) over the unix socket named in
+``vault.own_inbox.socket``: one request line out, one reply line back, nothing in argv. The code is typed into the
+page over the supervisor socket like every vault secret, and never reaches the tool result, a log line or the
+transcript. Limits, all enforced here:
 
-- only the inboxes listed in ``vault.own_inbox.addresses`` (the reader refuses any inbox it holds no key for);
+- only the inboxes listed in ``vault.own_inbox.addresses`` (the reader also refuses any inbox it holds no key for);
 - only the NEWEST message holding a code, received in the last 10 minutes, and each code at most once per process
   (a used code means "wait for the next mail", never "fall back to an older one" a resend has replaced);
 - the agent names the ``sender`` (a From domain or address, never a substring), so another site's newer code is
@@ -20,7 +22,7 @@ import hashlib
 import json
 import logging
 import re
-import subprocess
+import socket
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -47,7 +49,7 @@ def _list(value: Any) -> List[str]:
 
 def own_inbox_addresses(cfg: Optional[Dict[str, Any]] = None) -> List[str]:
     cfg = own_inbox_config() if cfg is None else cfg
-    if not isinstance(cfg.get("reader"), list) or not cfg.get("reader"):  # an argv list; one string is not a command
+    if not isinstance(cfg.get("socket"), str) or not cfg["socket"].strip():  # the reader service's unix socket
         return []
     return [a.lower() for a in _list(cfg.get("addresses"))]
 
@@ -104,23 +106,42 @@ def audit(outcome: str, origin: str, basis: Optional[str], inbox: str, sender: s
                outcome, origin, basis or "-", inbox, sender or "-")
 
 
-def _read(reader: List[str], inbox: str, sender: str, wait_s: int) -> Tuple[Optional[dict], Optional[str]]:
+_MAX_REPLY = 65536
+
+
+def _ask(sock_path: str, request: str, timeout: float) -> bytes:
+    """One request line to the reader service, its whole reply back (it closes the connection after one answer)."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+        conn.settimeout(timeout)
+        conn.connect(sock_path)
+        conn.sendall(request.encode() + b"\n")
+        conn.shutdown(socket.SHUT_WR)
+        reply = b""
+        while len(reply) <= _MAX_REPLY:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            reply += chunk
+        return reply
+
+
+def _read(sock_path: str, inbox: str, sender: str, wait_s: int) -> Tuple[Optional[dict], Optional[str]]:
     """``(newest, None)`` with the reader's newest ``{"code", "received_at"}`` (None when it found none), or
     ``(None, error)``. The reader does the waiting (on the mail server's push where it has one) and skips codes
     already used. Its output is checked, never trusted: anything malformed is an error, not a crash."""
     request = json.dumps({"address": inbox, "sender": sender, "max_age_s": MAX_AGE_S, "wait_s": wait_s,
                           "skip": sorted(_used)})
     try:
-        proc = subprocess.run(reader, input=request, capture_output=True, text=True, timeout=wait_s + 60, check=False)
-    except (OSError, subprocess.SubprocessError) as exc:
-        return None, f"the inbox reader could not run: {type(exc).__name__}"
+        raw = _ask(sock_path, request, wait_s + 60)
+    except OSError as exc:
+        return None, f"the inbox reader could not be reached: {type(exc).__name__}"
     try:
-        reply = json.loads(proc.stdout or "")
+        reply = json.loads(raw)
     except ValueError:
         reply = None
-    if proc.returncode != 0 or not isinstance(reply, dict) or "error" in reply:
+    if not isinstance(reply, dict) or "error" in reply:
         why = reply.get("error") if isinstance(reply, dict) else None
-        return None, f"the inbox reader failed: {str(why or f'exit {proc.returncode}, no usable reply')[:200]}"
+        return None, f"the inbox reader failed: {str(why or 'no usable reply')[:200]}"
     found = reply.get("candidates")
     newest = found[0] if isinstance(found, list) and found else None
     if newest is None:
@@ -137,7 +158,7 @@ def _read(reader: List[str], inbox: str, sender: str, wait_s: int) -> Tuple[Opti
 def fetch_code(inbox: str, sender: str, wait_s: int, cfg: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
     """``(code, None)``: the newest unused code in ``inbox`` from the last 10 minutes, waiting up to ``wait_s`` for
     one to arrive; ``(None, error)`` otherwise. The code is returned to the caller only, never logged."""
-    newest, err = _read(_list(cfg.get("reader")), inbox, sender, max(0, min(int(wait_s), _MAX_WAIT_S)))
+    newest, err = _read(str(cfg.get("socket") or "").strip(), inbox, sender, max(0, min(int(wait_s), _MAX_WAIT_S)))
     if err or newest is None:
         return None, err
     if time.time() - newest["received_at"] > MAX_AGE_S or hashlib.sha256(newest["code"].encode()).hexdigest() in _used:
