@@ -417,17 +417,26 @@ _JSONRPC_INVALID_PARAMS = -32602
 
 
 def _invalid_params_error(exc: BaseException) -> Optional[Any]:
-    """The ``ErrorData`` of a ``-32602 Invalid params`` reply anywhere in *exc*'s tree, else None.
+    """The ``ErrorData`` when *exc* IS the server's ``-32602 Invalid params`` reply, else None.
 
     Structural code only, never a message substring: this reply proves the server is up and the
-    CALL was wrong, so callers must not count it as an outage. ``-32600`` is deliberately not
-    included: the SDK also uses it for "Session not found" / "Session terminated", which are
-    transport problems the session-expired recoverer owns."""
-    for node in _iter_exception_nodes(exc):
-        error = getattr(node, "error", None)
-        if getattr(error, "code", None) == _JSONRPC_INVALID_PARAMS:
-            return error
-    return None
+    CALL was wrong, so callers must not count it as an outage. Only the raised error itself counts
+    (an anyio group qualifies only when every non-cancellation leaf is such a reply);
+    ``__cause__``/``__context__`` are not followed, so a transport error raised while a -32602 was
+    being handled stays a transport error. An ``InterruptedError`` leaf wins, as in
+    :func:`_is_session_expired_error`. ``-32600`` is deliberately not included: the SDK also uses
+    it for "Session not found" / "Session terminated", which the session-expired recoverer owns."""
+    leaves, stack = [], [exc]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, BaseExceptionGroup):
+            stack.extend(node.exceptions)
+        elif not isinstance(node, asyncio.CancelledError):
+            leaves.append(node)
+    errors = [getattr(leaf, "error", None) for leaf in leaves]
+    if not leaves or any(getattr(e, "code", None) != _JSONRPC_INVALID_PARAMS for e in errors):
+        return None
+    return errors[0]
 
 
 def _format_connect_error(exc: BaseException) -> str:

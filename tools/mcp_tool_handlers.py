@@ -322,16 +322,17 @@ def _handle_stdio_child_exited_and_retry(server_name: str, exc: Exception, retry
             f"{type(retry_exc).__name__}: {_exc_str(retry_exc)}"))
 
 
-def _invalid_params_result(server_name: str, op: str, error: Any, record_outcome: bool) -> str:
+def _invalid_params_result(server_name: str, server: Any, op: str, error: Any) -> str:
     """The server's ``-32602 Invalid params`` reply, as the tool's own answer. The server is up and
     the arguments were wrong, so this is never an outage strike: counting it let three bad
     arguments in a row lock the server out for the breaker cooldown as "unreachable", and the
-    model gave up instead of fixing the call (T-488). A completed round trip closes the outage
-    count. Repeating the identical bad call is the per-turn tool guardrail's job
-    (``agent/tool_guardrails.py``), not the outage breaker's. The reply's ``data`` (vault hints
-    such as "pass its updated_at as if_updated_at") is kept so the model can fix the call."""
-    if record_outcome:
-        _core._reset_server_error(server_name)
+    model gave up instead of fixing the call (T-488). It is neutral to the breaker (no strike, no
+    reset), and the completed round trip proves the session. Repeating the identical bad call is
+    the per-turn tool guardrail's job (``agent/tool_guardrails.py``), not the outage breaker's.
+    The reply's ``data`` (vault hints such as "pass its updated_at as if_updated_at") is kept so
+    the model can fix the call; ``tool_error`` bounds the text."""
+    if callable(getattr(server, "_mark_session_proven", None)):
+        server._mark_session_proven()
     message = str(getattr(error, "message", "") or "invalid params")
     data = getattr(error, "data", None)
     if data not in (None, "", {}, []):
@@ -340,10 +341,10 @@ def _invalid_params_result(server_name: str, op: str, error: Any, record_outcome
         except (TypeError, ValueError):
             detail = str(data)
         message = f"{message} {detail}"
-    logger.info("MCP %s/%s rejected the arguments (-32602): %s", server_name, op, message)
-    return tool_error(_sanitize_error(_truncate_mcp_text_result(
-        f"MCP server '{server_name}' rejected the arguments (the server is reachable; fix the call and retry): "
-        f"{message}")), invalid_params=True)
+    message = _sanitize_error(message)
+    logger.info("MCP %s/%s rejected the arguments (-32602): %.500s", server_name, op, message)
+    return tool_error(f"MCP server '{server_name}' rejected the arguments (the server is reachable; fix the call "
+                      f"and retry): {message}", invalid_params=True)
 
 
 def _dispatch(server_name: str, server: Any, op: str, call, tool_timeout: float, recoverers,
@@ -366,7 +367,7 @@ def _dispatch(server_name: str, server: Any, op: str, call, tool_timeout: float,
     except Exception as exc:
         rejected = _invalid_params_error(exc)
         if rejected is not None:
-            return _invalid_params_result(server_name, op, rejected, record_outcome)
+            return _invalid_params_result(server_name, server, op, rejected)
         for recover in recoverers:
             recovered = recover(server_name, exc, call_once, op)
             if recovered is not None:

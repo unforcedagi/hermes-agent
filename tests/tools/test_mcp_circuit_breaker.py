@@ -655,3 +655,29 @@ def test_invalid_params_rejection_never_trips_the_outage_breaker(monkeypatch, tm
     finally:
         _cleanup(mcp_tool, "vault")
         mcp_tool._server_errors_all_application.pop("vault", None)
+
+
+def test_transport_error_raised_while_handling_invalid_params_still_strikes(monkeypatch, tmp_path):
+    """Only the raised error itself is classified: a transport failure whose ``__context__`` is a
+    -32602 reply is still an outage strike, not "fix your arguments"."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from mcp.shared.exceptions import MCPError
+    from tools import mcp_tool
+    from tools.mcp_tool_handlers import _make_tool_handler
+
+    async def _call_tool(*a, **kw):
+        try:
+            raise MCPError(code=-32602, message="bad args")
+        except MCPError:
+            raise ConnectionError("transport died")
+
+    _install_stub_server(mcp_tool, "vault", _call_tool)
+    _mcp_loop._ensure_mcp_loop()
+    try:
+        err = json.loads(_make_tool_handler("vault", "update_note", 10.0)({}))["error"]
+        assert "rejected the arguments" not in err, err
+        assert mcp_tool._server_error_counts.get("vault", 0) == 1
+    finally:
+        _cleanup(mcp_tool, "vault")
+        mcp_tool._server_errors_all_application.pop("vault", None)
