@@ -501,26 +501,12 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, se
 
     from tools import browser_vault_tool_own_inbox as own
 
-    from_inbox = from_inbox and not (meta is not None and getattr(meta, "has_otp", False))  # a saved key mints it
-    own_cfg, basis = (own.own_inbox_config(), None) if from_inbox else ({}, None)
-    if from_inbox:
-        addresses = own.own_inbox_addresses(own_cfg)
-        inbox = (inbox.strip().lower() or (addresses[0] if addresses else ""))
-        if inbox not in addresses:
-            return json.dumps({"success": False, "error_type": "inbox_not_allowed", "error": (
-                f"{inbox or 'No inbox'} is not one of your own inboxes (vault.own_inbox.addresses: "
-                f"{', '.join(addresses) or 'none configured'}). Codes for the user's accounts come from the user: "
-                "call again without source.")})
-        if not sender.strip():
-            return json.dumps({"success": False, "error_type": "sender_required", "error": (
-                "Pass sender=<the domain the site mails from, or its exact address> so only that site's mail is read. "
-                "Nothing was read.")})
-        basis = own.origin_basis(origin, allowed, named_site, own_cfg)
-        if basis is None:
-            own.audit("refused", origin, None, inbox, sender)
-            return json.dumps({"success": False, "error_type": "origin_not_allowed", "error": (
-                f"Refused: {origin} is not bound to a saved login or listed in vault.own_inbox.origins. If this code "
-                "is for this exact site, name it with site=<its origin>; the call is audited. Nothing was read.")})
+    own_cfg = own.own_inbox_config() if from_inbox else {}
+    inbox, basis, refusal = own.gate(own_cfg, inbox, sender, origin, allowed, named_site) if from_inbox else (inbox, None, None)
+    # A saved authenticator key mints the code without any mail, so its gate refusal waits until that has failed.
+    minted = meta is not None and getattr(meta, "has_otp", False)
+    if refusal and not minted:
+        return json.dumps(refusal)
 
     nonce = secrets.token_hex(8)
     inspect = _eval_js(effective_task_id, build_inspection_js(nonce))
@@ -543,6 +529,8 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, se
         if code:
             source = backend.name
     if not code and from_inbox:
+        if refusal:
+            return _unstamp(effective_task_id, refusal)
         code, err = own.fetch_code(inbox, sender, wait_s, own_cfg)
         if not code:
             own.audit("not found" if not err else "reader failed", origin, basis, inbox, sender)

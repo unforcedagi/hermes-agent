@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 MAX_AGE_S = 600
 _MAX_WAIT_S = 120
-_CODE = re.compile(r"\d{4,8}")  # what a reader may hand back: anything else is refused, never typed
+_CODE = re.compile(r"[0-9]{4,8}")  # what a reader may hand back: anything else is refused, never typed
 _used: set = set()  # sha256 of codes already entered: a stale code is never typed twice
 
 
@@ -47,7 +47,7 @@ def _list(value: Any) -> List[str]:
 
 def own_inbox_addresses(cfg: Optional[Dict[str, Any]] = None) -> List[str]:
     cfg = own_inbox_config() if cfg is None else cfg
-    if not isinstance(cfg.get("reader"), list) or not cfg.get("reader"):
+    if not _list(cfg.get("reader")):
         return []
     return [a.lower() for a in _list(cfg.get("addresses"))]
 
@@ -70,6 +70,30 @@ def origin_basis(origin: str, item_origins: List[str], site: str, cfg: Dict[str,
     if site and norm(site) == origin:
         return "named"
     return None
+
+
+def gate(cfg: Dict[str, Any], inbox: str, sender: str, origin: str, item_origins: List[str],
+         site: str) -> Tuple[str, Optional[str], Optional[Dict[str, Any]]]:
+    """``(inbox, basis, None)`` when this call may read a code from the agent's inbox, else ``(inbox, None, refusal)``.
+    Nothing is read here; a refused origin is audited."""
+    addresses = own_inbox_addresses(cfg)
+    inbox = inbox.strip().lower() or (addresses[0] if addresses else "")
+    if inbox not in addresses:
+        return inbox, None, {"success": False, "error_type": "inbox_not_allowed", "error": (
+            f"{inbox or 'No inbox'} is not one of your own inboxes (vault.own_inbox.addresses: "
+            f"{', '.join(addresses) or 'none configured'}). Codes for the user's accounts come from the user: "
+            "call again without source.")}
+    if not sender.strip():
+        return inbox, None, {"success": False, "error_type": "sender_required", "error": (
+            "Pass sender=<the domain the site mails from, or its exact address> so only that site's mail is read. "
+            "Nothing was read.")}
+    basis = origin_basis(origin, item_origins, site, cfg)
+    if basis is None:
+        audit("refused", origin, None, inbox, sender)
+        return inbox, None, {"success": False, "error_type": "origin_not_allowed", "error": (
+            f"Refused: {origin} is not bound to a saved login or listed in vault.own_inbox.origins. If this code "
+            "is for this exact site, name it with site=<its origin>; the call is audited. Nothing was read.")}
+    return inbox, basis, None
 
 
 def audit(outcome: str, origin: str, basis: Optional[str], inbox: str, sender: str) -> None:

@@ -154,6 +154,9 @@ def test_reader_refuses_an_inbox_it_holds_no_key_for(mailbox):
     ("Welcome!", "Your member ID is 553311.", None),  # no word that names a code: not a code
     ("Sign in", "This code is valid until Nov 21, 2026. Code: 482913", "482913"),
     ("Sign in", "We sent a code to the phone ending in 4321. Your code is 482913", "482913"),
+    ("Order", "Order 12345678 received. Your verification code is 4821.", "4821"),
+    ("Code", "Your code is 2024.", "2024"),
+    ("Code", "Your code is \u0664\u0668\u0662\u0661\u0669\u0663", None),  # only ASCII digits are typed
     ("Hello", "Call 555 0100 or 555 0199 about 301122 or 301133", None),  # ambiguous: no code
     ("Receipt", "Total 2026 items, ref 12", None),
     ("Hi", "Your code is ready " + "x" * 66 + " ref 4815162342", None),  # a long number across the window is not a code
@@ -182,6 +185,7 @@ def test_a_malformed_reader_reply_is_a_clean_refusal(mailbox, monkeypatch, reply
 
 
 @pytest.mark.parametrize("frm,sender,ok", [
+    ('"no-reply@acme.test" <x@evil.example>', "acme.test", False),  # a display name is not the address
     ("no-reply@acme.test", "acme.test", True),
     ("Acme <no-reply@mail.acme.test>", "acme.test", True),
     ("no-reply@acme.test.attacker.example", "acme.test", False),
@@ -191,3 +195,20 @@ def test_a_malformed_reader_reply_is_a_clean_refusal(mailbox, monkeypatch, reply
 ])
 def test_sender_matches_the_from_domain_not_a_substring(frm, sender, ok):
     assert _reader_module().from_matches(frm, sender) is ok
+
+
+@pytest.mark.parametrize("sender,ok", [("acme.test", True), ("no-reply@gmail.com", True), ("com", False),
+                                       ("gmail.com", False), (".com", False)])
+def test_a_sender_must_name_one_site(sender, ok):
+    assert _reader_module().sender_ok(sender) is ok
+
+
+def test_a_saved_authenticator_key_wins_over_the_inbox(mailbox, tmp_path):
+    from agent.vault_store import VaultStore
+
+    store = VaultStore(tmp_path / "vault")
+    meta = store.add_item("login", "acme", {"identifier_type": "username", "identifier": "agent", "password": "pw",
+                                            "otp_secret": "JBSWY3DPEHPK3PXP"}, origin="https://acme.test")
+    with patch("agent.vault_store.get_vault_store", return_value=store):
+        out, raw, typed = _enter(handle=meta.id)  # own_inbox asked for, no sender: the key mints it, no mail is read
+    assert out["success"] and out["source"] == "local" and len(typed) == 1 and mailbox.requests == 0
