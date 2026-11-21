@@ -121,3 +121,30 @@ def test_configured_route_with_a_query_string_keeps_its_cap(tmp_path, monkeypatc
 
     _chat(routed)
     assert requests and requests[-1].get("max_tokens") == 4321, requests[-1]
+
+
+def test_switch_with_a_base_signature_plugin_engine_does_not_break(tmp_path, monkeypatch, local_server):
+    """A plugin ContextEngine keeping the base ``update_model`` signature (no ``max_tokens``) must
+    still survive a /model switch: the reservation is passed only to engines that take it."""
+    from agent.context_engine import ContextEngine
+
+    class PlainEngine(ContextEngine):
+        name = "plain"
+        threshold_tokens = 0
+        context_length = 0
+
+        def update_from_response(self, usage):
+            pass
+
+        def should_compress(self, prompt_tokens=None):
+            return False
+
+        def compress(self, messages, current_tokens=None, **kwargs):
+            return messages
+
+    base_url, requests = local_server
+    _home(tmp_path, monkeypatch, base_url, max_tokens=7777)
+    agent = _chat(base_url)
+    agent.context_compressor = PlainEngine()
+    agent.switch_model("other-model", "custom", api_key="local-test", base_url=base_url)
+    assert agent.model == "other-model"

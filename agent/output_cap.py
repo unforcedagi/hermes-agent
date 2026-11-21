@@ -14,6 +14,7 @@ never inherits it, and switching onto (or restoring) the configured model brings
 bounded tasks) always wins.
 """
 
+import inspect
 from contextlib import suppress
 import logging
 from typing import Any, Optional, Tuple
@@ -72,3 +73,16 @@ def output_reservation(agent: Any) -> int:
         if gemini_provider or is_native_gemini_base_url(getattr(agent, "base_url", "")):
             return GEMINI_DEFAULT_MAX_OUTPUT_TOKENS
     return 0
+
+
+def reservation_kwargs(engine: Any, agent: Any) -> dict:
+    """``{"max_tokens": output_reservation(agent)}`` for an engine whose ``update_model`` takes it
+    (the built-in compressor), else ``{}``: a plugin ``ContextEngine`` keeping the base signature
+    has no ``max_tokens`` parameter and would raise TypeError on every switch or fallback."""
+    try:
+        params = inspect.signature(engine.update_model).parameters.values()
+    except (TypeError, ValueError, AttributeError):
+        return {}
+    if any(p.name == "max_tokens" or p.kind is inspect.Parameter.VAR_KEYWORD for p in params):
+        return {"max_tokens": output_reservation(agent)}
+    return {}
