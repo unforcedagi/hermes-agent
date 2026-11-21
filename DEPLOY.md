@@ -18,8 +18,9 @@ Nothing live changes until Uni merges and the gateway restarts.
    (plus `inbox`, `sender`, `site`, `wait_s`). Hermes runs the configured reader, takes the newest unused code from
    the last 10 minutes and types it over the supervisor socket. The model sees only "entered" / "no code found";
    the code is not in argv, tool output, logs or the session DB. Limits: only `vault.own_inbox.addresses`; the
-   reader opens only the inboxes named on its own command line; the call names the `sender` (so another site's
-   newer code is never read); a used code means "wait for the next mail"; the page origin must be bound to the saved login,
+   reader opens only the inboxes named on its own command line; the call names the `sender` (a From domain or
+   address, so another site's newer code is never read); a used code means "wait for the next mail" (the reader
+   waits on Stalwart's push stream, up to `wait_s`); the page origin must be bound to the saved login,
    listed in `vault.own_inbox.origins`, or named in the call (`site`). Every attempt writes one
    `AUDIT vault own-inbox code <outcome>: origin=… basis=item|config|named inbox=… sender=…` line to `agent.log`.
    With no `vault.own_inbox` config the schema is unchanged.
@@ -68,13 +69,13 @@ At the next planned gateway restart (Uni's or Aaron's call). Nothing to migrate.
 SOUL.md, the "Never type a password…" line, replace its second sentence with:
 
 > A code sent to one of Uni's own inboxes: call `browser_vault_enter_code` with `source="own_inbox"` (and
-> `sender=` the site's domain); Hermes reads and enters it and you never see it. Never read such a code yourself
+> `sender=` the domain the site mails from); Hermes reads and enters it and you never see it. Never read such a code yourself
 > into chat, a log or `browser_exec`. Codes for Aaron's accounts come from his prompt (no `source`).
 
 Skill `agent-web-logins`, "Magic-link / emailed-link sign-ins": add after the AgentMail line:
 
-> One-time codes (not links) in your own inboxes: `browser_vault_enter_code(source="own_inbox", sender=<site
-> domain>)`, never a curl loop. It waits up to `wait_s` (default 60 s) for the mail.
+> One-time codes (not links) in your own inboxes: `browser_vault_enter_code(source="own_inbox", sender=<the
+> domain the site mails from>)`, never a curl loop. It waits up to `wait_s` (default 60 s) for the mail.
 
 ## Subtract
 

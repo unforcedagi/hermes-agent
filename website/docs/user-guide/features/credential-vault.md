@@ -50,8 +50,9 @@ Sites that ask for a code after the password are handled the same way:
 - **Code sent to the agent's own inbox** (an account the agent holds itself,
   signed up with its own address): with `vault.own_inbox` configured, the agent
   calls `browser_vault_enter_code` with `source: own_inbox` and the `sender`
-  (usually the site's domain). Hermes runs your reader command, takes the code
-  in that sender's newest mail from the last 10 minutes (once) and enters it; the agent sees only "entered" or "no code found". It works only
+  (the domain the site mails from). Hermes runs your reader command, takes the
+  code in that sender's newest mail from the last 10 minutes (once, waiting for
+  the mail if it has not arrived yet) and enters it; the agent sees only "entered" or "no code found". It works only
   for the listed addresses, and only on a site bound to a saved login, listed
   in `origins`, or named by the agent in the call (each call writes an
   `AUDIT vault own-inbox code` line to `agent.log`). Never list your own

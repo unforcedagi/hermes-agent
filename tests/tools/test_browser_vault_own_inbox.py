@@ -82,7 +82,7 @@ def mailbox(tmp_path, monkeypatch):
     box.server.shutdown()
 
 
-def _enter(page_origin="https://acme.test", **kw):
+def _enter(page_origin="https://acme.test", wait_s=0, **kw):
     seen = {}
     fake_eval = lambda t, e: {"success": True, "result": json.dumps(OTP_BOX) if "querySelectorAll" in e else page_origin + "/2fa"}
 
@@ -93,7 +93,7 @@ def _enter(page_origin="https://acme.test", **kw):
     with patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None), \
          patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval), \
          patch.object(browser_vault_tool, "_eval_js_secret", side_effect=fake_secret):
-        raw = browser_vault_tool.browser_vault_enter_code(task_id="t", source="own_inbox", wait_s=0, **kw)
+        raw = browser_vault_tool.browser_vault_enter_code(task_id="t", source="own_inbox", wait_s=wait_s, **kw)
     typed = re.findall(r'"value": "(\d+)"', seen.get("expr", ""))
     return json.loads(raw), raw, typed
 
@@ -115,6 +115,14 @@ def test_newest_fresh_code_is_entered_unseen_once_and_audited(mailbox, caplog):
     again, _, typed_again = _enter(site="https://acme.test", sender="acme.test")
     assert again["error_type"] == "no_code_found" and typed_again == []
 
+    def resend():
+        time.sleep(1.5)
+        mailbox.messages.append({"from": "no-reply@mail.acme.test", "subject": "Your new code", "body": "Code: 906144",
+                                 "at": time.time()})
+    threading.Thread(target=resend, daemon=True).start()
+    third, _, typed_third = _enter(site="https://acme.test", sender="acme.test", wait_s=20)  # waits for the resend
+    assert third["success"] and typed_third == ["906144"]
+
 
 def test_origin_without_basis_is_refused_before_any_mail_is_read(mailbox, caplog):
     mailbox.messages = [{"from": "x@evil.test", "subject": "code", "body": "Your code is 654321", "at": time.time()}]
@@ -133,7 +141,7 @@ def test_reader_refuses_an_inbox_it_holds_no_key_for(mailbox):
     import subprocess
 
     cfg = own.own_inbox_config()
-    proc = subprocess.run(cfg["reader"], input=json.dumps({"address": "user@inbox.test"}), capture_output=True,
+    proc = subprocess.run(cfg["reader"], input=json.dumps({"address": "user@inbox.test", "sender": "acme.test"}), capture_output=True,
                           text=True, timeout=30)
     assert proc.returncode == 1 and "not one of this reader's inboxes" in proc.stdout and mailbox.requests == 0
 
@@ -143,7 +151,9 @@ def test_reader_refuses_an_inbox_it_holds_no_key_for(mailbox):
     ("123456 is your login code", "", "123456"),
     ("Welcome", "Order #554433 shipped on 2026-11-21 for $120000. Your one-time passcode: 8842", "8842"),
     ("Sign in", "<p>Your security code is <b>662-019</b></p>", "662019"),
-    ("Hello", "Your account number is 998877.", "998877"),     # one bare 6-digit number: it is the code
+    ("Welcome!", "Your member ID is 553311.", None),  # no word that names a code: not a code
+    ("Sign in", "This code is valid until Nov 21, 2026. Code: 482913", "482913"),
+    ("Sign in", "We sent a code to the phone ending in 4321. Your code is 482913", "482913"),
     ("Hello", "Call 555 0100 or 555 0199 about 301122 or 301133", None),  # ambiguous: no code
     ("Receipt", "Total 2026 items, ref 12", None),
     ("Hi", "Your code is ready " + "x" * 66 + " ref 4815162342", None),  # a long number across the window is not a code
@@ -162,9 +172,22 @@ def test_hermes_enforces_the_ten_minutes_whatever_the_reader_returns(mailbox, mo
     assert out["error_type"] == "no_code_found" and typed == []
 
 
-@pytest.mark.parametrize("reply", ["null", "[1, 2]", '{"candidates": [{"code": "1234", "received_at": "yesterday"}]}', "not json"])
+@pytest.mark.parametrize("reply", ["null", "[1, 2]", '{"candidates": [{"code": "1234", "received_at": "yesterday"}]}', "not json",
+                                   '{"candidates": [{"code": "None", "received_at": 9999999999}]}'])
 def test_a_malformed_reader_reply_is_a_clean_refusal(mailbox, monkeypatch, reply):
     cfg = {**own.own_inbox_config(), "reader": [sys.executable, "-I", "-c", f"print({reply!r})"]}
     monkeypatch.setattr(own, "own_inbox_config", lambda: cfg)
     out, _, typed = _enter(site="https://acme.test", sender="acme.test")
     assert out["error_type"] == "reader_failed" and typed == []
+
+
+@pytest.mark.parametrize("frm,sender,ok", [
+    ("no-reply@acme.test", "acme.test", True),
+    ("Acme <no-reply@mail.acme.test>", "acme.test", True),
+    ("no-reply@acme.test.attacker.example", "acme.test", False),
+    ("x@evil-acme.test", "acme.test", False),
+    ("no-reply@acme.test", "no-reply@acme.test", True),
+    ("other@acme.test", "no-reply@acme.test", False),
+])
+def test_sender_matches_the_from_domain_not_a_substring(frm, sender, ok):
+    assert _reader_module().from_matches(frm, sender) is ok

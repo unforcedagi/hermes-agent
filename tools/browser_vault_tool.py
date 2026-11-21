@@ -501,6 +501,7 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, se
 
     from tools import browser_vault_tool_own_inbox as own
 
+    from_inbox = from_inbox and not (meta is not None and getattr(meta, "has_otp", False))  # a saved key mints it
     own_cfg, basis = (own.own_inbox_config(), None) if from_inbox else ({}, None)
     if from_inbox:
         addresses = own.own_inbox_addresses(own_cfg)
@@ -512,8 +513,8 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, se
                 "call again without source.")})
         if not sender.strip():
             return json.dumps({"success": False, "error_type": "sender_required", "error": (
-                "Pass sender=<part of the sender's address, usually the site's domain> so only that site's mail is "
-                "read. Nothing was read.")})
+                "Pass sender=<the domain the site mails from, or its exact address> so only that site's mail is read. "
+                "Nothing was read.")})
         basis = own.origin_basis(origin, allowed, named_site, own_cfg)
         if basis is None:
             own.audit("refused", origin, None, inbox, sender)
