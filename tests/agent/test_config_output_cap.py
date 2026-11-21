@@ -89,6 +89,10 @@ def test_configured_cap_reaches_the_custom_endpoint(tmp_path, monkeypatch, local
     # Switching onto the configured model brings the cap AND the compressor's output reservation.
     other.switch_model("local-model", "custom", api_key="local-test", base_url=base_url)
     assert other.context_compressor.max_tokens == 7777
+    other.chat("now capped")
+    assert requests[-1].get("max_tokens") == 7777, requests[-1]
+    other.switch_model("other-model", "custom", api_key="local-test", base_url=base_url)
+    assert other.context_compressor.max_tokens is None  # switching away clears the reservation
 
     agent = _chat(base_url)
     requests.clear()

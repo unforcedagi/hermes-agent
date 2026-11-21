@@ -1852,7 +1852,7 @@ def _resolve_context_length(agent, _agent_cfg, base_url):
     return _config_context_length, _custom_providers, _effective_context_length, _model_cfg
 
 
-def _resolve_config_max_tokens(agent, _agent_cfg, _custom_providers) -> None:
+def _resolve_config_max_tokens(agent, _agent_cfg, _custom_providers, base_url) -> None:
     """Read ``model.max_tokens`` (the configured default model's output cap) once. Whether it applies
     is decided per runtime by ``agent/output_cap.py``, with the same scoping as ``model.context_length``,
     so an agent started on another model still picks it up after a switch onto the configured one."""
@@ -1871,15 +1871,17 @@ def _resolve_config_max_tokens(agent, _agent_cfg, _custom_providers) -> None:
         )
         return
     agent._config_max_tokens = _cap
-    agent._config_max_tokens_scope = (_agent_cfg, _model_cfg, _custom_providers)
+    # base_url: the URL as requested (init strips a query string off agent.base_url; the scope
+    # check restores it from this when it is the same route).
+    agent._config_max_tokens_scope = (_agent_cfg, _model_cfg, _custom_providers, str(base_url or ""))
 
 
 def config_max_tokens_applies(agent) -> bool:
     """True when the configured cap describes ``agent``'s current runtime (``model.context_length`` scoping)."""
-    _agent_cfg, _model_cfg, _custom_providers = agent._config_max_tokens_scope
+    _agent_cfg, _model_cfg, _custom_providers, _requested_url = agent._config_max_tokens_scope
     return _scope_context_length_to_default_runtime(
         agent, _agent_cfg, _model_cfg, _custom_providers, agent._config_max_tokens,
-        str(getattr(agent, "base_url", "") or ""), setting="model.max_tokens",
+        _requested_url or str(getattr(agent, "base_url", "") or ""), setting="model.max_tokens",
     ) is not None
 
 
@@ -2445,7 +2447,7 @@ def init_agent(
     _config_context_length, _custom_providers, _effective_context_length, _model_cfg = _resolve_context_length(
         agent, _agent_cfg, base_url
     )
-    _resolve_config_max_tokens(agent, _agent_cfg, _custom_providers)
+    _resolve_config_max_tokens(agent, _agent_cfg, _custom_providers, base_url)
     _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, session_db)
     _configure_ollama_num_ctx(agent, _model_cfg, _config_context_length)
     _enforce_minimum_context(agent)
