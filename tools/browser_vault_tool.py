@@ -857,11 +857,33 @@ def _session_schema_overrides(schema: Dict[str, Any]):
     return overrides
 
 
+def _holding_the_page(handler):
+    """Hold the browser a vault call acts on for the whole call. Its prompt (a one-time code, an unlock, a card
+    confirmation, a login to save) can wait minutes for the user, past the browser's inactivity timeout, and the
+    page must still be open, with the supervisor on it, when the answer comes (T-487: every code entry on the
+    Spark failed with ``supervisor_required`` because the browser had been closed under the prompt)."""
+    def handle(args: Dict[str, Any], **kwargs) -> str:
+        from tools.browser_tool_lifecycle import hold_browser_session
+
+        task_id, session = kwargs.get("task_id"), str(args.get("session") or "").strip()
+        if _browser_use_mode():  # the key browser_exec drove that session's browser under
+            from tools.browser_use_cli import _backend_cache_key, last_exec_session
+            key = _backend_cache_key(task_id, session or last_exec_session(task_id) or "")
+        else:
+            from tools.browser_tool import _last_session_key
+            key = _last_session_key(task_id or "default")
+        with hold_browser_session(key):
+            return handler(args, **kwargs)
+    return handle
+
+
+@_holding_the_page
 def _handle_vault_enter_code(args: Dict[str, Any], **kwargs) -> str:
     return browser_vault_enter_code(handle=str(args.get("handle") or ""), task_id=kwargs.get("task_id"),
                                     session=str(args.get("session") or ""))
 
 
+@_holding_the_page
 def _handle_vault_save_login(args: Dict[str, Any], **kwargs) -> str:
     if args.get("set_password") is True or str(args.get("set_password")).lower() == "true":
         from tools.browser_vault_tool_set_password import browser_vault_set_password
@@ -880,6 +902,7 @@ def _handle_vault_unlock(args: Dict[str, Any], **kwargs) -> str:
     return browser_vault_unlock(str(args.get("backend") or ""))
 
 
+@_holding_the_page
 def _handle_vault_fill(args: Dict[str, Any], **kwargs) -> str:
     return browser_vault_fill(
         handle=str(args.get("handle") or ""), task_id=kwargs.get("task_id"), session=str(args.get("session") or "")

@@ -157,7 +157,8 @@ def _cleanup_inactive_browser_sessions():
 
     with _bt._cleanup_lock:
         sessions_to_cleanup = [task_id for task_id, last_time in list(_bt._session_last_activity.items())
-                               if current_time - last_time > _bt.BROWSER_SESSION_INACTIVITY_TIMEOUT]
+                               if current_time - last_time > _bt.BROWSER_SESSION_INACTIVITY_TIMEOUT
+                               and task_id not in _bt._session_holds]
 
     for task_id in sessions_to_cleanup:
         elapsed = int(current_time - _bt._session_last_activity.get(task_id, current_time))
@@ -182,6 +183,40 @@ def _cleanup_inactive_browser_sessions():
                 _bt.logger.error("Force-reap of browser session %s failed: %s", task_id, reap_exc)
             finally:
                 _forget_session_tracking(task_id, activity=False)
+
+
+@contextlib.contextmanager
+def hold_browser_session(task_id: str):
+    """Keep session ``task_id``'s browser open while a tool waits on the user. A vault prompt (a one-time
+    code, an unlock, a card confirmation) can take minutes, longer than the inactivity timeout, and the page
+    it fills must still be there when the answer comes. Nothing to hold (no such session) is a no-op."""
+    with _bt._cleanup_lock:
+        _bt._session_holds[task_id] = _bt._session_holds.get(task_id, 0) + 1
+    try:
+        yield
+    finally:
+        with _bt._cleanup_lock:
+            left = _bt._session_holds.get(task_id, 0) - 1
+            if left > 0:
+                _bt._session_holds[task_id] = left
+            else:
+                _bt._session_holds.pop(task_id, None)
+
+
+def _keep_held_sessions_alive() -> None:
+    """Reset the agent-browser daemon's own idle clock for held sessions. A browser launched with ``--session``
+    (no ``cdp_url``) belongs to the daemon, which quits after ``AGENT_BROWSER_IDLE_TIMEOUT_MS`` without a
+    command and takes the browser with it; the supervisor's CDP traffic does not count. Pinged at a third of
+    the timeout so a held browser never gets near it."""
+    due = time.time() - _bt.BROWSER_SESSION_INACTIVITY_TIMEOUT / 3
+    with _bt._cleanup_lock:  # a session that is gone is not re-created here: the ping would launch a blank browser
+        keys = [key for key in _bt._session_holds if key in _bt._active_sessions
+                and not _bt._active_sessions[key].get("cdp_url") and _bt._session_last_activity.get(key, 0) < due]
+    for key in keys:
+        with _session_owner_scope(key):
+            res = _session._run_browser_command(key, "get", ["cdp-url"])
+        if not res.get("success"):
+            _bt.logger.warning("Could not keep held browser session %s alive: %s", key, res.get("error"))
 
 
 def _write_owner_pid(socket_dir: str, session_name: str) -> None:
@@ -420,6 +455,10 @@ def _browser_cleanup_thread_worker():
         for _ in range(30):  # 1s granularity so stop is quick
             if not _bt._cleanup_running:
                 break
+            try:
+                _keep_held_sessions_alive()
+            except Exception as e:
+                _bt.logger.warning("Held-session keepalive error: %s", e)
             time.sleep(1)
 
 
