@@ -910,8 +910,8 @@ def _enter_code_schema_overrides() -> Optional[Dict[str, Any]]:
 def _holding_the_page(handler):
     """Hold the browser a vault call acts on for the whole call. Its prompt (a one-time code, an unlock, a card
     confirmation, a login to save) can wait minutes for the user, past the browser's inactivity timeout, and the
-    page must still be open, with the supervisor on it, when the answer comes (T-487: every code entry on the
-    Spark failed with ``supervisor_required`` because the browser had been closed under the prompt)."""
+    page must still be open, with the supervisor on it, when the answer comes (T-487: code entries failed with
+    ``supervisor_required`` because the browser had been closed under the prompt)."""
     def handle(args: Dict[str, Any], **kwargs) -> str:
         from tools.browser_tool_lifecycle import hold_browser_session
 

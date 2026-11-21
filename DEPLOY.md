@@ -12,9 +12,9 @@ Nothing live changes until Uni merges and the gateway restarts.
    browser at 120 s. The supervisor gave up after five reconnects, and `_eval_js_secret`
    (`tools/browser_vault_tool.py:139`) found no supervisor. Every failure in the logs waited 159–591 s.
    Now `hold_browser_session()` keeps the janitor off the session and pings its daemon, and the vault fill,
-   save-login and enter-code handlers hold the page for the whole call. Not the Spark move: the 11-11 failure
-   predates it (11-18).
-2. **Codes sent to Uni's own inboxes** (Aaron, 11-21). `browser_vault_enter_code` takes `source: "own_inbox"`
+   save-login and enter-code handlers hold the page for the whole call. Not the 11-18 machine move: the 11-11
+   failure predates it.
+2. **Codes sent to Uni's own inboxes** (owner's rule, 11-21). `browser_vault_enter_code` takes `source: "own_inbox"`
    (plus `inbox`, `sender`, `site`, `wait_s`). Hermes runs the configured reader, takes the newest unused code from
    the last 10 minutes and types it over the supervisor socket. The model sees only "entered" / "no code found";
    the code is not in argv, tool output, logs or the session DB. Limits: only `vault.own_inbox.addresses`; the
@@ -38,13 +38,13 @@ git push fork plugin-inject-origin       # fork only; no upstream PR
 ## Config (Uni edits `~/.hermes/config.yaml`)
 
 Add under `vault:` (the two addresses are Uni's own inboxes from the 11-21 addendum; the run report has the block
-with them filled in):
+with them and the two credential paths filled in):
 
 ```yaml
   own_inbox:
-    reader: [sudo, -n, /usr/bin/python3, -I, /home/uni/REPOS/hermes-agent/scripts/own_inbox_code.py,
-             --jmap, "<agi inbox>=/var/lib/uni-mail/secrets/stalwart_agi_unforced_dev",
-             --agentmail, "<uni inbox>=/home/uni/.config/agentmail/curl.cfg"]
+    reader: [sudo, -n, /usr/bin/python3, -I, <live checkout>/scripts/own_inbox_code.py,
+             --jmap, "<agi inbox>=<root-only Stalwart password file>",
+             --agentmail, "<uni inbox>=<AgentMail curl config>"]
     addresses: [<agi inbox>, <uni inbox>]
     origins: []
 ```
@@ -52,11 +52,11 @@ with them filled in):
 The reader runs as root because the Stalwart secret is root-only and the mail ports refuse non-root connections
 on this box. The gateway unit has `NoNewPrivileges=no`, so `sudo -n` works from it today. When passwordless sudo
 is retired (SOUL, 11-19), install the reader root-owned (e.g. `/usr/local/libexec/own-inbox-code`, mode 755,
-root:root) with a sudoers line for that exact path, and point `reader` at it. Never list Aaron's mailboxes.
+root:root) with a sudoers line for that exact path, and point `reader` at it. Never list the owner's mailboxes.
 
 ## Restart
 
-At the next planned gateway restart (Uni's or Aaron's call). Nothing to migrate.
+At the next planned gateway restart (Uni's call or the owner's). Nothing to migrate.
 
 ## Check after the restart
 
@@ -70,7 +70,7 @@ SOUL.md, the "Never type a password…" line, replace its second sentence with:
 
 > A code sent to one of Uni's own inboxes: call `browser_vault_enter_code` with `source="own_inbox"` (and
 > `sender=` the domain the site mails from); Hermes reads and enters it and you never see it. Never read such a code yourself
-> into chat, a log or `browser_exec`. Codes for Aaron's accounts come from his prompt (no `source`).
+> into chat, a log or `browser_exec`. Codes for the owner's accounts come from their prompt (no `source`).
 
 Skill `agent-web-logins`, "Magic-link / emailed-link sign-ins": add after the AgentMail line:
 
