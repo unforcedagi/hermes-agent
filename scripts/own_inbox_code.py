@@ -129,11 +129,12 @@ def _get(url: str, headers: dict, body: Optional[dict] = None, context=None) -> 
     return json.loads(urllib.request.urlopen(req, context=context, timeout=30).read())
 
 
-def _jmap_inbox(address: str, secret_file: str, base: str) -> Tuple[Callable, Callable]:
+def _jmap_inbox(address: str, secret_file: str, base: str, sender: str) -> Tuple[Callable, Callable]:
     """``(messages(since), wait(seconds))`` for a JMAP account. ``wait`` returns when the server pushes a change
     (the session's EventSource, on the same loopback base) or the time is up."""
     raw = open(secret_file, encoding="utf-8").read().strip()
-    if not _EMAIL.fullmatch(raw.partition(":")[0]):  # the password alone (it may hold a colon or an @ itself)
+    login, colon, _ = raw.partition(":")
+    if not (colon and _EMAIL.fullmatch(login)):  # the password alone (it may hold an @ or a colon itself)
         raw = f"{address}:{raw}"
     headers = {"Authorization": "Basic " + base64.b64encode(raw.encode()).decode()}
     ctx = ssl._create_unverified_context() if urllib.parse.urlsplit(base).hostname in ("127.0.0.1", "localhost") else None
@@ -162,24 +163,37 @@ def _jmap_inbox(address: str, secret_file: str, base: str) -> Tuple[Callable, Ca
             pass
         return False
 
-    return (lambda since: _jmap_query(base, headers, ctx, account, using, outgoing, since)), wait
+    return (lambda since: _jmap_query(base, headers, ctx, account, using, outgoing, since, sender)), wait
 
 
-def _jmap_query(base: str, headers: dict, ctx, account: str, using: dict, outgoing: list, since: float) -> Iterable[tuple]:
+def _jmap_get(base: str, headers: dict, ctx, using: dict, calls: list) -> list:
+    out = _get(base + "/jmap/", headers, {**using, "methodCalls": calls}, context=ctx)
+    return next(r[1].get("list") or [] for r in out["methodResponses"] if r[0] == "Email/get")
+
+
+def _jmap_query(base: str, headers: dict, ctx, account: str, using: dict, outgoing: list, since: float,
+                sender: str) -> Iterable[tuple]:
+    """Newest first: the From of every recent message (all of the window, whatever else arrived), then the bodies
+    of the sender's messages one at a time, so the caller stops at the first that holds a code."""
     after = datetime.fromtimestamp(since, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     match = {"after": after, "inMailboxOtherThan": outgoing}  # from_matches decides the sender (subdomains too)
-    calls = [["Email/query", {"accountId": account, "filter": match,
-                              "sort": [{"property": "receivedAt", "isAscending": False}], "limit": 20}, "q"],
-             ["Email/get", {"accountId": account, "#ids": {"resultOf": "q", "name": "Email/query", "path": "/ids"},
-                            "properties": ["from", "subject", "receivedAt", "textBody", "htmlBody", "bodyValues"],
-                            "fetchTextBodyValues": True, "fetchHTMLBodyValues": True}, "g"]]
-    out = _get(base + "/jmap/", headers, {**using, "methodCalls": calls}, context=ctx)
-    for m in out["methodResponses"][1][1]["list"]:
-        values = m.get("bodyValues") or {}
-        parts = (m.get("textBody") or []) or (m.get("htmlBody") or [])
-        body = " ".join(str((values.get(p.get("partId")) or {}).get("value") or "") for p in parts)
-        sender = ",".join(a.get("email", "") for a in (m.get("from") or []))
-        yield _epoch(m["receivedAt"]), sender, m.get("subject") or "", body
+    heads = _jmap_get(base, headers, ctx, using, [
+        ["Email/query", {"accountId": account, "filter": match,
+                         "sort": [{"property": "receivedAt", "isAscending": False}], "limit": 500}, "q"],
+        ["Email/get", {"accountId": account, "#ids": {"resultOf": "q", "name": "Email/query", "path": "/ids"},
+                       "properties": ["id", "from", "receivedAt"]}, "g"]])
+    for head in heads:
+        frm = ",".join(a.get("email", "") for a in (head.get("from") or []))
+        if not from_matches(frm, sender):
+            continue
+        full = _jmap_get(base, headers, ctx, using, [["Email/get", {
+            "accountId": account, "ids": [head["id"]], "fetchTextBodyValues": True, "fetchHTMLBodyValues": True,
+            "properties": ["from", "subject", "receivedAt", "textBody", "htmlBody", "bodyValues"]}, "g"]])
+        for m in full:
+            values = m.get("bodyValues") or {}
+            parts = (m.get("textBody") or []) or (m.get("htmlBody") or [])
+            body = " ".join(str((values.get(p.get("partId")) or {}).get("value") or "") for p in parts)
+            yield _epoch(m["receivedAt"]), frm, m.get("subject") or "", body
 
 
 def _agentmail_inbox(address: str, curl_config: str, sender: str) -> Tuple[Callable, Callable]:
@@ -245,7 +259,7 @@ def main(argv: List[str]) -> int:
                                        "(not a bare suffix or a free-mail domain)"}))
             return 1
         if address in jmap:
-            messages, wait = _jmap_inbox(address, jmap[address], args.jmap_url.rstrip("/"))
+            messages, wait = _jmap_inbox(address, jmap[address], args.jmap_url.rstrip("/"), sender)
         elif address in agentmail:
             messages, wait = _agentmail_inbox(address, agentmail[address], sender)
         else:

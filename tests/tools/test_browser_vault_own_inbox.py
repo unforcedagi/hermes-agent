@@ -50,10 +50,14 @@ class _Mailbox:
                 if calls[0][0] == "Mailbox/get":
                     self._json({"methodResponses": [["Mailbox/get", {"list": [{"id": "i", "role": "inbox"}]}, "m"]]})
                     return
-                listed = [{"from": [{"email": m["from"]}], "subject": m["subject"],
+                listed = [{"id": str(i), "from": [{"email": m["from"]}], "subject": m["subject"],
                            "receivedAt": datetime.fromtimestamp(m["at"], timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                            "textBody": [{"partId": "1"}], "bodyValues": {"1": {"value": m["body"]}}}
-                          for m in sorted(box.messages, key=lambda m: -m["at"])]  # the query sorts newest first
+                          for i, m in sorted(enumerate(box.messages), key=lambda im: -im[1]["at"])]  # newest first
+                listed = listed[:calls[0][1].get("limit", 10**6)] if calls[0][0] == "Email/query" else listed
+                ids = calls[-1][1].get("ids")
+                if ids is not None:  # a body fetch for named messages
+                    listed = [m for m in listed if m["id"] in ids]
                 self._json({"methodResponses": [["Email/query", {}, "q"], ["Email/get", {"list": listed}, "g"]]})
 
             def _json(self, obj):
@@ -215,3 +219,12 @@ def test_a_saved_authenticator_key_wins_over_the_inbox(mailbox, tmp_path):
     with patch("agent.vault_store.get_vault_store", return_value=store):
         out, raw, typed = _enter(handle=meta.id)  # own_inbox asked for, no sender: the key mints it, no mail is read
     assert out["success"] and out["source"] == "local" and len(typed) == 1 and mailbox.requests == 0
+
+
+def test_a_busy_inbox_does_not_hide_the_sites_mail(mailbox):
+    now = time.time()
+    mailbox.messages = [{"from": "no-reply@acme.test", "subject": "Code", "body": "Your code is 318264", "at": now - 120}]
+    mailbox.messages += [{"from": f"news{i}@other.test", "subject": "News", "body": "Your code is 111111", "at": now - i}
+                         for i in range(30)]  # thirty newer mails from other senders
+    out, _, typed = _enter(site="https://acme.test", sender="acme.test")
+    assert out["success"] and typed == ["318264"]
