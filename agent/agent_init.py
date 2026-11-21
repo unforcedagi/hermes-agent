@@ -39,7 +39,7 @@ from agent.tool_guardrails import (
 )
 from hermes_cli.config import DEFAULT_CONFIG, cfg_get
 from hermes_cli.route_identity import normalize_route_base_url
-from agent.output_cap import output_reservation
+from agent.output_cap import output_cap_route, output_reservation
 from hermes_cli.timeouts import get_provider_request_timeout
 from hermes_constants import get_hermes_home
 from hermes_state_ids import new_session_id
@@ -1871,17 +1871,19 @@ def _resolve_config_max_tokens(agent, _agent_cfg, _custom_providers, base_url) -
         )
         return
     agent._config_max_tokens = _cap
-    # base_url: the URL as requested (init strips a query string off agent.base_url; the scope
-    # check restores it from this when it is the same route).
-    agent._config_max_tokens_scope = (_agent_cfg, _model_cfg, _custom_providers, str(base_url or ""))
+    # base_url: the URL as requested at construction (init strips a query string off
+    # agent.base_url); used for the construction runtime only, like model.context_length.
+    agent._config_max_tokens_scope = (_agent_cfg, _model_cfg, _custom_providers, str(base_url or ""),
+                                      output_cap_route(agent))
 
 
 def config_max_tokens_applies(agent) -> bool:
     """True when the configured cap describes ``agent``'s current runtime (``model.context_length`` scoping)."""
-    _agent_cfg, _model_cfg, _custom_providers, _requested_url = agent._config_max_tokens_scope
+    _agent_cfg, _model_cfg, _custom_providers, _init_url, _init_route = agent._config_max_tokens_scope
+    _url = _init_url if output_cap_route(agent) == _init_route else str(getattr(agent, "base_url", "") or "")
     return _scope_context_length_to_default_runtime(
         agent, _agent_cfg, _model_cfg, _custom_providers, agent._config_max_tokens,
-        _requested_url or str(getattr(agent, "base_url", "") or ""), setting="model.max_tokens",
+        _url, setting="model.max_tokens",
     ) is not None
 
 

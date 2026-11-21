@@ -1284,7 +1284,7 @@ def restore_primary_runtime(agent) -> bool:
             model=rt["compressor_model"], context_length=rt["compressor_context_length"],
             base_url=rt["compressor_base_url"], api_key=rt["compressor_api_key"],
             provider=rt["compressor_provider"], api_mode=rt.get("compressor_api_mode", ""),
-            max_tokens=output_reservation(agent) or 0,  # the restored route's output reservation
+            max_tokens=output_reservation(agent),  # the restored route's output reservation
         )
         # Same rule as fallback activation: refresh an existing verdict only; never-probed sessions stay lazy.
         if getattr(agent, "_compression_feasibility_checked", False) is True:
@@ -2193,7 +2193,7 @@ def _update_switch_compressor(agent, custom_providers, effective_context_length,
             api_key=agent.api_key,  # context_compressor forwards to call_llm; callable preserved
             provider=agent.provider,
             api_mode=agent.api_mode,
-            max_tokens=output_reservation(agent) or 0,  # the new route's output reservation
+            max_tokens=output_reservation(agent),  # the new route's output reservation
         )
     except Exception:
         _restore_switch_snapshot(agent, snapshot)

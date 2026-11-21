@@ -47,26 +47,28 @@ def effective_max_tokens(agent: Any) -> Optional[int]:
             from agent.agent_init import config_max_tokens_applies  # lazy: agent_init imports this module
             applies = config_max_tokens_applies(agent)
         except Exception:
-            logger.warning("Could not scope model.max_tokens to %s; sending no output cap", route, exc_info=True)
+            logger.warning("Could not scope model.max_tokens to %s on %s; sending no output cap",
+                           route[0], route[1], exc_info=True)  # never the URL: a query string can hold a key
             applies = False
         memo = agent._config_max_tokens_memo = (route, applies)
     return cap if memo[1] else None
 
 
-def output_reservation(agent: Any) -> Optional[int]:
+def output_reservation(agent: Any) -> int:
     """The output the compressor reserves out of the window on the CURRENT runtime: the request's cap,
     or the native-Gemini adapter default when unset (generateContent still sends maxOutputTokens=65,535
     and the threshold is pct x (window - max_tokens), so reserving 0 let the provider 400 before
-    compaction fired). None = no reservation. Re-derived on every runtime change (switch, fallback,
-    primary restore; callers pass ``or 0`` so an uncapped route clears the old one) so it tracks the
-    cap actually sent."""
+    compaction fired). 0 = no reservation (never None: ``update_model`` reads None as "keep the old
+    one"). Re-derived on every runtime change (switch, fallback, primary restore) so an uncapped
+    route clears a capped route's reservation and it tracks the cap actually sent."""
     cap = effective_max_tokens(agent)
     if cap is not None:
         return cap
     with suppress(Exception):
-        from agent.auxiliary_client import _GEMINI_NATIVE_PROVIDER_NAMES
         from agent.gemini_native_adapter import GEMINI_DEFAULT_MAX_OUTPUT_TOKENS, is_native_gemini_base_url
-        gemini_provider = str(getattr(agent, "provider", "") or "").strip().lower() in _GEMINI_NATIVE_PROVIDER_NAMES
+        gemini_provider = str(getattr(agent, "provider", "") or "").strip().lower() in {
+            "gemini", "google", "google-gemini", "google-ai-studio",
+        }
         if gemini_provider or is_native_gemini_base_url(getattr(agent, "base_url", "")):
             return GEMINI_DEFAULT_MAX_OUTPUT_TOKENS
-    return None
+    return 0

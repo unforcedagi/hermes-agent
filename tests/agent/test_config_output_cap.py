@@ -26,7 +26,7 @@ def local_server():
 
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
-            if not self.path.endswith("/chat/completions"):  # endpoint probes (e.g. Ollama /api/show)
+            if not self.path.split("?", 1)[0].endswith("/chat/completions"):  # endpoint probes (e.g. Ollama /api/show)
                 self.send_response(404)
                 self.end_headers()
                 return
@@ -110,3 +110,14 @@ def test_no_setting_leaves_the_server_default(tmp_path, monkeypatch, local_serve
 
     _chat(base_url)
     assert requests and "max_tokens" not in requests[-1], requests[-1]
+
+
+def test_configured_route_with_a_query_string_keeps_its_cap(tmp_path, monkeypatch, local_server):
+    """Init moves a base URL's query string into the client's default query; the configured route
+    (which keeps it) must still match, or the cap is silently dropped on Azure-style URLs."""
+    base_url, requests = local_server
+    routed = f"{base_url}?api-version=2026-01-01"
+    _home(tmp_path, monkeypatch, routed, max_tokens=4321)
+
+    _chat(routed)
+    assert requests and requests[-1].get("max_tokens") == 4321, requests[-1]

@@ -185,7 +185,10 @@ def _retry_once(server_name: str, retry_call, op_description: str, what: str):
     except Exception as retry_exc:
         rejected = _invalid_params_error(retry_exc)
         if rejected is not None:  # the retry reached the server and it rejected the arguments
-            return _invalid_params_result(server_name, _lookup_reconnectable_server(server_name), op_description, rejected)
+            from tools.mcp_tool_scope import _resolve_server_key
+            with _core._lock:
+                srv = _core._servers.get(_resolve_server_key(server_name))
+            return _invalid_params_result(server_name, srv, op_description, rejected)
         logger.warning("MCP %s/%s retry after %s failed: %s", server_name, op_description, what, retry_exc)
         return None
     return _record_call_outcome(server_name, result)
