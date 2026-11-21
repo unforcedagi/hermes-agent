@@ -470,17 +470,20 @@ _TAB_PROBES["otp"] = _tab_probe("input[autocomplete=one-time-code], input[name*=
                                 "input[id*=otp i], input[id*=code i], input[name*=totp i], input[aria-label*=code i]")
 
 
-def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, session: str = "") -> str:
+def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, session: str = "", source: str = "",
+                             inbox: str = "", sender: str = "", site: str = "", wait_s: int = 60) -> str:
     """Second factor: fill the one-time code the CURRENT page asks for. If the saved login (``handle``) has an
-    authenticator seed, the code is minted server-side and nobody is asked; otherwise the user is prompted on
-    their surface for the code their phone/email/app shows. The code goes into the page over the supervisor
-    socket and never enters the conversation."""
+    authenticator seed, the code is minted server-side and nobody is asked; ``source="own_inbox"`` reads it from the
+    agent's own mailbox (``browser_vault_tool_own_inbox``); otherwise the user is prompted on their surface for the
+    code their phone/email/app shows. The code goes into the page over the supervisor socket and never enters the
+    conversation."""
     from agent.redact import register_vault_redaction_value
     from agent.vault_backends import backend_for_handle
     from agent.vault_backends.unlock import can_prompt_here, get_code_prompt_callback
     from agent.vault_login_classifier import LoginControl, build_fill_js, build_inspection_js, build_otp_fills, classify_otp_controls
 
     effective_task_id = task_id or "default"
+    from_inbox, named_site = source == "own_inbox", site
     _, origin, refusal = _locate_page(effective_task_id, session, "otp")
     if refusal:
         return json.dumps(refusal)
@@ -495,6 +498,25 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, se
         return json.dumps({"success": False, "error_type": "origin_mismatch",
                            "error": (f"Refused: the page origin ({origin}) is not the site this login was saved for "
                                      f"({', '.join(allowed)}). No code was generated or asked for.")})
+
+    from tools import browser_vault_tool_own_inbox as own
+
+    own_cfg, basis = (own.own_inbox_config(), None) if from_inbox else ({}, None)
+    if from_inbox:
+        addresses = own.own_inbox_addresses(own_cfg)
+        inbox = (inbox.strip().lower() or (addresses[0] if addresses else ""))
+        if inbox not in addresses:
+            return json.dumps({"success": False, "error_type": "inbox_not_allowed", "error": (
+                f"{inbox or 'No inbox'} is not one of your own inboxes (vault.own_inbox.addresses: "
+                f"{', '.join(addresses) or 'none configured'}). Codes for the user's accounts come from the user: "
+                "call again without source.")})
+        basis = own.origin_basis(origin, allowed, named_site, sender, own_cfg)
+        if basis is None:
+            own.audit("refused", origin, None, inbox, sender)
+            return json.dumps({"success": False, "error_type": "origin_not_allowed", "error": (
+                f"Refused: {origin} is not bound to a saved login or listed in vault.own_inbox.origins. If this code "
+                "is for this exact site, name it with site=<its origin> and sender=<part of the sender's address>; the "
+                "call is audited. Nothing was read.")})
 
     nonce = secrets.token_hex(8)
     inspect = _eval_js(effective_task_id, build_inspection_js(nonce))
@@ -516,7 +538,16 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, se
             code = None
         if code:
             source = backend.name
-    if not code:
+    if not code and from_inbox:
+        code, err = own.fetch_code(inbox, sender, wait_s, own_cfg)
+        if not code:
+            own.audit("not found" if not err else "reader failed", origin, basis, inbox, sender)
+            return _unstamp(effective_task_id, {"success": False, "error_type": "no_code_found" if not err else "reader_failed",
+                               "error": err or (f"No unused code in {inbox} from the last 10 minutes"
+                                                + (f" from a sender matching {sender!r}" if sender else "")
+                                                + ". Check the site sent it to this inbox, then call again.")})
+        source = "own_inbox"
+    elif not code:
         prompt = get_code_prompt_callback()
         if prompt is None or not can_prompt_here():
             return _unstamp(effective_task_id, {"success": False, "error_type": "prompt_unavailable",
@@ -530,15 +561,19 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, se
     register_vault_redaction_value(code)
     fills = build_otp_fills(otp_controls, code)
     result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
+    parsed = _parse_json_result(result.get("result")) if result.get("success") else None
+    if isinstance(parsed, str):
+        parsed = _parse_json_result(parsed)
+    filled = int(parsed.get("filled", 0)) if isinstance(parsed, dict) else 0
+    if source == "own_inbox":
+        if filled:
+            own.mark_used(code)
+        own.audit("entered" if filled else "fill failed", origin, basis, inbox, sender)
     del code
     if not result.get("success"):
         return json.dumps({"success": False, "error": str(result.get("error") or "fill failed")[:200]})
-    parsed = _parse_json_result(result.get("result"))
-    if isinstance(parsed, str):
-        parsed = _parse_json_result(parsed)
     if isinstance(parsed, dict) and parsed.get("refused") == "origin_changed":
         return json.dumps({"success": False, "error_type": "origin_changed", "error": "The page navigated before the code could be entered. Nothing was written."})
-    filled = int(parsed.get("filled", 0)) if isinstance(parsed, dict) else 0
     return json.dumps({"success": bool(filled), "filled_fields": filled, "origin": origin, "source": source,
                        "next": "Submit the form (many sites auto-submit when the last digit lands)."})
 
@@ -857,6 +892,25 @@ def _session_schema_overrides(schema: Dict[str, Any]):
     return overrides
 
 
+def _enter_code_schema_overrides() -> Optional[Dict[str, Any]]:
+    """The session parameter (Browser Use mode), plus the own-inbox source when ``vault.own_inbox`` names inboxes:
+    nobody else's schema carries it."""
+    from tools.browser_vault_tool_own_inbox import OWN_INBOX_PROPERTIES, own_inbox_addresses
+
+    base = _session_schema_overrides(BROWSER_VAULT_ENTER_CODE_SCHEMA)() or {}
+    addresses = own_inbox_addresses()
+    if not addresses:
+        return base or None
+    params = base.get("parameters") or BROWSER_VAULT_ENTER_CODE_SCHEMA["parameters"]
+    inbox = {**OWN_INBOX_PROPERTIES["inbox"], "enum": addresses}
+    return {"parameters": {**params, "properties": {**params["properties"], **OWN_INBOX_PROPERTIES, "inbox": inbox}},
+            "description": BROWSER_VAULT_ENTER_CODE_SCHEMA["description"] + (
+                " For an account that is YOUR OWN (signed up with one of your own addresses: "
+                f"{', '.join(addresses)}), pass source=\"own_inbox\" after the site sends the code: Hermes reads the "
+                "newest code from that inbox (last 10 minutes) and enters it, and you never see it. Never use it for "
+                "the user's accounts.")}
+
+
 def _holding_the_page(handler):
     """Hold the browser a vault call acts on for the whole call. Its prompt (a one-time code, an unlock, a card
     confirmation, a login to save) can wait minutes for the user, past the browser's inactivity timeout, and the
@@ -879,8 +933,14 @@ def _holding_the_page(handler):
 
 @_holding_the_page
 def _handle_vault_enter_code(args: Dict[str, Any], **kwargs) -> str:
+    try:
+        wait_s = int(args.get("wait_s") if args.get("wait_s") is not None else 60)
+    except (TypeError, ValueError, OverflowError):
+        wait_s = 60
     return browser_vault_enter_code(handle=str(args.get("handle") or ""), task_id=kwargs.get("task_id"),
-                                    session=str(args.get("session") or ""))
+                                    session=str(args.get("session") or ""), source=str(args.get("source") or ""),
+                                    inbox=str(args.get("inbox") or ""), sender=str(args.get("sender") or ""),
+                                    site=str(args.get("site") or ""), wait_s=wait_s)
 
 
 @_holding_the_page
@@ -945,7 +1005,7 @@ registry.register(
     name="browser_vault_enter_code",
     toolset="browser",
     schema=BROWSER_VAULT_ENTER_CODE_SCHEMA,
-    dynamic_schema_overrides=_session_schema_overrides(BROWSER_VAULT_ENTER_CODE_SCHEMA),
+    dynamic_schema_overrides=_enter_code_schema_overrides,
     handler=_handle_vault_enter_code,
     check_fn=_check_vault_available,
     emoji="🔐",

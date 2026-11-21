@@ -46,6 +46,27 @@ Sites that ask for a code after the password are handled the same way:
 - **Code sent to your phone or email**: a small prompt appears in your
   surface ("Verification code for github.com"), you type the code, Hermes
   enters it into the page. The code never enters the conversation either.
+  The browser stays open while the prompt waits, however long you take.
+- **Code sent to the agent's own inbox** (an account the agent holds itself,
+  signed up with its own address): with `vault.own_inbox` configured, the agent
+  calls `browser_vault_enter_code` with `source: own_inbox`. Hermes runs your
+  reader command, takes the newest unused code from the last 10 minutes and
+  enters it; the agent sees only "entered" or "no code found". It works only
+  for the listed addresses, and only on a site bound to a saved login, listed
+  in `origins`, or named by the agent in the call (each call writes an
+  `AUDIT vault own-inbox code` line to `agent.log`). Never list your own
+  mailbox here: these codes go to the agent without asking you.
+
+  ```yaml
+  vault:
+    own_inbox:
+      # scripts/own_inbox_code.py: each inbox named with the credential that opens it
+      reader: [sudo, -n, python3, -I, /path/to/hermes-agent/scripts/own_inbox_code.py,
+               --jmap, "agent@example.com=/root-only/jmap-password-file",
+               --agentmail, "agent@agentmail.example=/path/to/agentmail-curl.cfg"]
+      addresses: [agent@example.com, agent@agentmail.example]
+      origins: []           # sites that may always take such a code
+  ```
 - **Passkeys, hardware keys, app approvals** ("tap Approve in Duo"): nothing
   to type. The agent tells you to complete it on your device and waits for
   the page to move on.

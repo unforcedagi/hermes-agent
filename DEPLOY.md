@@ -1,57 +1,86 @@
-# DEPLOY: T-488 Hermes local-model fixes
+# DEPLOY: T-487 vault fill keeps its browser; codes from Uni's own inboxes
 
-Branch `fix/mcp-breaker-param-errors-max-tokens`, cut from the live branch `plugin-inject-origin` at `350b5070c5`.
+Branch `fix/vault-fill-supervisor`, cut from the live branch `plugin-inject-origin` at `040ef1f07f`.
 Nothing live changes until Uni merges and the gateway restarts.
 
 ## What changes
 
-1. **MCP breaker.** A JSON-RPC `-32602 Invalid params` reply (the Parachute vault's answer to an update without
-   `if_updated_at`) is now the tool's answer: it neither adds nor clears a breaker strike, and the model sees the
-   server's message and hint. Before, three in a row marked the server "unreachable" for 60 s.
-2. **Output cap.** `model.max_tokens` in config.yaml now reaches the wire for the configured default model on its own
-   route. With no setting nothing changes: the server's default applies. The live config does not set it, so live
-   requests to Claude are unchanged.
+1. **The browser stays open while a vault prompt waits.** Root cause of the `supervisor_required` failures
+   (11-11, 11-20, 11-21 ×2): `browser_vault_enter_code` blocks on the user's code (the Buzz 🔐 card) for minutes.
+   Meanwhile the inactivity janitor (`tools/browser_tool_lifecycle.py::_cleanup_inactive_browser_sessions`) and the
+   agent-browser daemon's own idle exit (`AGENT_BROWSER_IDLE_TIMEOUT_MS`, `browser_tool_session.py:161`) closed the
+   browser at 120 s. The supervisor gave up after five reconnects, and `_eval_js_secret`
+   (`tools/browser_vault_tool.py:139`) found no supervisor. Every failure in the logs waited 159–591 s.
+   Now `hold_browser_session()` keeps the janitor off the session and pings its daemon, and the vault fill,
+   save-login and enter-code handlers hold the page for the whole call. Not the Spark move: the 11-11 failure
+   predates it (11-18).
+2. **Codes sent to Uni's own inboxes** (Aaron, 11-21). `browser_vault_enter_code` takes `source: "own_inbox"`
+   (plus `inbox`, `sender`, `site`, `wait_s`). Hermes runs the configured reader, takes the newest unused code from
+   the last 10 minutes and types it over the supervisor socket. The model sees only "entered" / "no code found";
+   the code is not in argv, tool output, logs or the session DB. Limits: only `vault.own_inbox.addresses`; the
+   reader opens only the inboxes named on its own command line; the page origin must be bound to the saved login,
+   listed in `vault.own_inbox.origins`, or named in the call (`site`). Every attempt writes one
+   `AUDIT vault own-inbox code <outcome>: origin=… basis=item|config|named inbox=… sender=…` line to `agent.log`.
+   With no `vault.own_inbox` config the schema is unchanged.
 
 ## Merge (on uni, in the live checkout)
 
 ```bash
 cd ~/REPOS/hermes-agent
 git status --short                       # must be empty
-git log -1 --format=%h                   # expect 350b5070c5; if the live branch moved, use the rebase line below
-git merge --ff-only fix/mcp-breaker-param-errors-max-tokens
-# if the live branch moved on:  git rebase plugin-inject-origin fix/mcp-breaker-param-errors-max-tokens && git merge --ff-only fix/mcp-breaker-param-errors-max-tokens
-git push fork plugin-inject-origin       # keep the fork in step (fork only; no upstream PR)
+git log -1 --format=%h                   # expect 040ef1f07f; if it moved: git rebase plugin-inject-origin fix/vault-fill-supervisor
+git merge --ff-only fix/vault-fill-supervisor
+git push fork plugin-inject-origin       # fork only; no upstream PR
 ```
 
-The branch is local to this repo (the worktree shares it) and also pushed to `fork`.
+## Config (Uni edits `~/.hermes/config.yaml`)
+
+Add under `vault:` (the two addresses are Uni's own inboxes from the 11-21 addendum; the run report has the block
+with them filled in):
+
+```yaml
+  own_inbox:
+    reader: [sudo, -n, /usr/bin/python3, -I, /home/uni/REPOS/hermes-agent/scripts/own_inbox_code.py,
+             --jmap, "<agi inbox>=/var/lib/uni-mail/secrets/stalwart_agi_unforced_dev",
+             --agentmail, "<uni inbox>=/home/uni/.config/agentmail/curl.cfg"]
+    addresses: [<agi inbox>, <uni inbox>]
+    origins: []
+```
+
+The reader runs as root because the Stalwart secret is root-only and the mail ports refuse non-root connections
+on this box. The gateway unit has `NoNewPrivileges=no`, so `sudo -n` works from it today. When passwordless sudo
+is retired (SOUL, 11-19), install the reader root-owned (e.g. `/usr/local/libexec/own-inbox-code`, mode 755,
+root:root) with a sudoers line for that exact path, and point `reader` at it. Never list Aaron's mailboxes.
 
 ## Restart
 
-At the next planned gateway restart (Uni's call, not as part of this merge):
-
-```bash
-systemctl --user restart hermes-gateway-2c0b9ad2.service
-```
+At the next planned gateway restart (Uni's or Aaron's call). Nothing to migrate.
 
 ## Check after the restart
 
-```bash
-systemctl --user is-active hermes-gateway-2c0b9ad2.service          # active
-journalctl --user -u hermes-gateway-2c0b9ad2.service --since "5 min ago" | grep -iE "traceback|error" | head
-```
+1. `grep -c "Vault fill requires the supervised" ~/.hermes/logs/agent.log` stops growing on code entries.
+2. In a room: a site that mails a code to Uni's inbox → `browser_vault_enter_code(source="own_inbox", sender=…)`
+   → `AUDIT vault own-inbox code entered` in `agent.log`, and the code is nowhere in the transcript.
 
-- Send Uni one ordinary message in a room; it answers as before (the Claude route is untouched).
-- The first time a model sends a bad vault argument, `~/.hermes/logs/agent.log` shows
-  `rejected the arguments (-32602)` and no `unreachable after 3 consecutive failures` for that server.
-- Only if a local model becomes the main model: set `model.max_tokens` (e.g. 16384) next to `model.context_length`.
+## Proposed wording (Uni applies; this branch does not touch ~/.hermes)
+
+SOUL.md, the "Never type a password…" line, replace its second sentence with:
+
+> A code sent to one of Uni's own inboxes: call `browser_vault_enter_code` with `source="own_inbox"` (and
+> `sender=` the site's domain); Hermes reads and enters it and you never see it. Never read such a code yourself
+> into chat, a log or `browser_exec`. Codes for Aaron's accounts come from his prompt (no `source`).
+
+Skill `agent-web-logins`, "Magic-link / emailed-link sign-ins": add after the AgentMail line:
+
+> One-time codes (not links) in your own inboxes: `browser_vault_enter_code(source="own_inbox", sender=<site
+> domain>)`, never a curl loop. It waits up to `wait_s` (default 60 s) for the mail.
+
+## Subtract
+
+Codes in Uni's own inboxes no longer go through `agimail.py grab` + a private file + a manual fill, or the AgentMail
+curl loop in `agent-web-logins`: once this is live, Uni drops the code half of those (agimail keeps `list` and
+links). The second way to read mail stays only because Hermes needs the code in-process and never on disk.
 
 ## Roll back
 
-```bash
-cd ~/REPOS/hermes-agent && git reset --keep 350b5070c5 && systemctl --user restart hermes-gateway-2c0b9ad2.service
-```
-
-## After it is live
-
-- The bench's `sim/hermes_nobreaker.py` (in `~/Code/wt/inkling-sim`, hybrid-experiment session) was a stopgap for
-  fix 1 and can go; `SIM_BREAKER=off` is then unnecessary.
+`git revert` the T-487 commits on `plugin-inject-origin`, remove `vault.own_inbox`, restart at the next window.
