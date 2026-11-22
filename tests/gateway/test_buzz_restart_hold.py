@@ -116,6 +116,10 @@ async def test_message_during_restart_drain_is_answered_after_restart(home):
     assert len(relay.sent) == 2
 
     await first.disconnect()  # a real shutdown disconnects; life 2 reads the cursor file it leaves
+    import json
+    saved = json.loads((home / "buzz" / "channel-cursors.json").read_text())["channels"][CHANNEL]
+    # the file's own cursor stops at the held message, so even code that knows nothing of holds re-reads it
+    assert saved["last_ts"] <= T0 + 200 and "during" not in saved["seen"]
 
     # Life 2: a new process, same HERMES_HOME. The held message is delivered; nothing else is.
     second = _adapter(relay)
@@ -280,6 +284,12 @@ async def test_an_expired_hold_stops_pinning_the_cursor(home, monkeypatch):
     await first._poll_channel(CHANNEL)
     await _settle(first)
     await first.disconnect()
+
+    # A life that restarts before it reads anything (the relay was down, say) must not lose the real cursor.
+    between = _adapter(relay)
+    between.set_message_handler(AsyncMock())
+    await _start(between)
+    await between.disconnect()
 
     real_time = time.time
     monkeypatch.setattr(_buzz.time, "time", lambda: real_time() + 7 * 3600)

@@ -1342,15 +1342,20 @@ class BuzzAdapter(BasePlatformAdapter):
             for event_id, hold in (raw_held.items() if isinstance(raw_held, dict) else ()):
                 with contextlib.suppress(AttributeError, TypeError, ValueError):
                     held[str(event_id)] = {"ts": int(hold["ts"]), "at": float(hold["at"])}
+            try:
+                high_ts = int(entry.get("high_ts") or 0)
+            except (TypeError, ValueError):
+                high_ts = 0
             self._restored_cursors[str(channel_id)] = {"chat_type": str(entry.get("chat_type") or ""), "last_ts": last_ts,
-                                                       "seen": seen, "held": held}
+                                                       "high_ts": high_ts, "seen": seen, "held": held}
 
-    def _save_cursors(self) -> None:
-        """Persist every watched channel's cursor.  Never raises.
+    def _save_cursors(self) -> bool:
+        """Persist every watched channel's cursor; False when it couldn't be written.  Never raises.
 
-        A held message is written as not yet seen, so the next start fetches it again (it resumes from the oldest
-        held message, see _restore_channel_state); in this process it stays seen, so it isn't dispatched twice before
-        the restart. ``last_ts`` stays the real high-water mark, so a hold that expires unread stops pinning it.
+        A held message is written as not yet seen and ``last_ts`` stops at it, so the next start fetches it again
+        (any reader, including one that doesn't know about holds); in this process it stays seen, so it isn't
+        dispatched twice before the restart. ``high_ts`` keeps the real high-water mark, so a hold that expires
+        unread stops pinning the cursor.
         """
         cutoff = time.time() - _REPLAY_TTL
         # A restored cursor for a conversation not adopted yet (DM discovery failed at boot) is kept as it was.
@@ -1360,8 +1365,10 @@ class BuzzAdapter(BasePlatformAdapter):
             # owed an answer: held here, or held by a previous process and not yet re-read.
             held = {event_id: hold for event_id, hold in {**(state.get("replay") or {}), **(state.get("held") or {})}.items()
                     if hold["at"] >= cutoff}
+            high_ts = max(int(state.get("high_ts") or 0), int(state.get("last_ts") or 0))
             channels[channel_id] = {
-                "chat_type": state.get("chat_type") or "group", "last_ts": int(state.get("last_ts") or 0),
+                "chat_type": state.get("chat_type") or "group",
+                "last_ts": min([high_ts, *(hold["ts"] for hold in held.values())]), "high_ts": high_ts,
                 "seen": [event_id for event_id in state.get("seen") or () if event_id not in held],
                 "held": held,
             }
@@ -1371,6 +1378,8 @@ class BuzzAdapter(BasePlatformAdapter):
             atomic_json_write(self._cursor_path(), payload, indent=None)
         except Exception:
             logger.debug("Buzz: could not persist channel cursors", exc_info=True)
+            return False
+        return True
 
     def hold_for_restart(self, events: List[MessageEvent]) -> bool:
         """Leave relay messages unconsumed so the restored cursor delivers them after the restart.
@@ -1387,11 +1396,15 @@ class BuzzAdapter(BasePlatformAdapter):
                 return False  # all or nothing: one message we can't replay and the caller refuses them all
             holds.append((state, event_id, created_at, event.source.chat_id))
         held_at = time.time()
-        for state, event_id, created_at, chat_id in holds:
+        for state, event_id, created_at, _chat_id in holds:
             state.setdefault("held", {})[event_id] = {"ts": created_at, "at": held_at}
+        if not self._save_cursors():  # not on disk, so nothing would bring it back: refuse instead of promising
+            for state, event_id, _created_at, _chat_id in holds:
+                state["held"].pop(event_id, None)
+            return False
+        for _state, event_id, _created_at, chat_id in holds:
             logger.info("Buzz: holding message %s in %s until the gateway is back", event_id[:12],
                         self._channel_names.get(str(chat_id), chat_id))
-        self._save_cursors()
         return bool(holds)
 
     @staticmethod
@@ -1413,8 +1426,9 @@ class BuzzAdapter(BasePlatformAdapter):
         state = self._new_channel_state(restored["chat_type"] or chat_type)
         cutoff = time.time() - _REPLAY_TTL
         owed = {event_id: hold for event_id, hold in (restored.get("held") or {}).items() if hold["at"] >= cutoff}
-        # resume from the oldest message still owed an answer, so it is fetched again
-        state["last_ts"] = min([restored["last_ts"], *(hold["ts"] for hold in owed.values())])
+        # resume from the oldest message still owed an answer, so it is fetched again; else from the real high-water
+        state["high_ts"] = max(restored.get("high_ts") or 0, restored["last_ts"])
+        state["last_ts"] = min([state["high_ts"], *(hold["ts"] for hold in owed.values())])
         state["seen"] = OrderedDict((event_id, None) for event_id in restored["seen"])
         for event_id in set(restored.get("held") or ()) - set(owed):  # let go: never answered late
             state["seen"][event_id] = None
