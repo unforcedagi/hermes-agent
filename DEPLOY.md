@@ -8,7 +8,9 @@ Two parts, independent. Do the memory guard first: it needs no restart.
 
 Installs the drop-ins from `~/Code/uni-ops/memory/dropins/` into `~/.config/systemd/user/`, runs
 `systemctl --user daemon-reload`, sets the running gateway's main process to oom_score_adj 100 and every process of
-the running mts workers to 900 (`choom`, unprivileged), then runs the check. Nothing restarts.
+the running mts workers to 900 (`choom`, unprivileged), then runs the check. Nothing restarts. It refuses (exit 2,
+nothing done) while any user unit has unloaded changes, since the reload would load those too:
+`~/Code/uni-ops/memory/staged-units` lists them.
 
 - Check: `~/Code/uni-ops/memory/check` — exit 0 and every line `ok`: gateway `user.oomd_omit` = 1, OOMPolicy
   continue, oom_score_adj 100; heavy.slice watched by oomd at 30.00%/10s; each mts worker's main process at 900;

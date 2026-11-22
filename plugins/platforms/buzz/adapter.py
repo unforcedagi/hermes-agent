@@ -1395,11 +1395,13 @@ class BuzzAdapter(BasePlatformAdapter):
             if not event_id or not created_at or state is None:
                 return False  # all or nothing: one message we can't replay and the caller refuses them all
             holds.append((state, event_id, created_at, event.source.chat_id))
-        held_at = time.time()
+        held_at, added = time.time(), []
         for state, event_id, created_at, _chat_id in holds:
-            state.setdefault("held", {})[event_id] = {"ts": created_at, "at": held_at}
+            if event_id not in state.setdefault("held", {}):
+                state["held"][event_id] = {"ts": created_at, "at": held_at}
+                added.append((state, event_id))
         if not self._save_cursors():  # not on disk, so nothing would bring it back: refuse instead of promising
-            for state, event_id, _created_at, _chat_id in holds:
+            for state, event_id in added:  # holds already on disk from an earlier call stay
                 state["held"].pop(event_id, None)
             return False
         for _state, event_id, _created_at, chat_id in holds:
@@ -1667,7 +1669,10 @@ class BuzzAdapter(BasePlatformAdapter):
         if not event_id or event_id in state["seen"]:
             return
         state["seen"][event_id] = None
-        owed = state.setdefault("replay", {}).pop(event_id, None) is not None
+        hold = state.setdefault("replay", {}).pop(event_id, None)
+        if hold is not None and hold["at"] < time.time() - _REPLAY_TTL:
+            return  # the hold expired before this start read it: let go, never answered late
+        owed = hold is not None
         state["last_ts"] = max(state["last_ts"], created_at)
         if int(event.get("kind") or 0) not in _DISPATCH_KINDS:
             return
