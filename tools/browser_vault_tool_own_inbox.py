@@ -33,7 +33,8 @@ logger = logging.getLogger(__name__)
 MAX_AGE_S = 600
 _MAX_WAIT_S = 120
 _CODE = re.compile(r"[0-9]{4,8}")  # what a reader may hand back: anything else is refused, never typed
-# Codes taken from a mail, keyed by sha256 of "code@received_at" -> received_at: one message's code is typed once (a
+_KEY = re.compile(r"[0-9a-f]{64}")
+# Codes taken from a mail, keyed by the reader's key for that message (inbox, code, received_at) -> received_at: one message's code is typed once (a
 # resend of the same code in a new mail is a new key), and is claimed before it is typed so two sessions never type
 # the same one. Process-wide on purpose: the inboxes belong to the machine, not to a profile. A key is dropped once its
 # mail is older than the reader's window, so the list holds minutes of mail, however long the gateway runs.
@@ -170,38 +171,36 @@ def _read(sock_path: str, inbox: str, sender: str, wait_s: int) -> Tuple[Optiona
     if newest is None:
         return None, None
     try:
-        code, received_at = str(newest["code"]), float(newest["received_at"])
+        code, received_at, key = str(newest["code"]), float(newest["received_at"]), str(newest["key"])
     except (TypeError, KeyError, ValueError):
-        return None, "the inbox reader failed: a reply without a code and a numeric received_at"
+        return None, "the inbox reader failed: a reply without a code, a numeric received_at and a key"
     if not _CODE.fullmatch(code):
         return None, "the inbox reader failed: what it returned is not a 4-8 digit code"
-    return {"code": code, "received_at": received_at}, None
-
-
-def used_key(inbox: str, code: str, received_at: float) -> str:
-    """The skip key for one message's code; the reader computes the same."""
-    return hashlib.sha256(f"{inbox}:{code}@{int(received_at)}".encode()).hexdigest()
+    if not _KEY.fullmatch(key):
+        return None, "the inbox reader failed: its key is not a sha256 digest"
+    return {"code": code, "received_at": received_at, "key": key}, None
 
 
 def fetch_code(inbox: str, sender: str, wait_s: int,
                cfg: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """``(code, None, claim)``: the newest unused code in ``inbox`` from the last 10 minutes, waiting up to ``wait_s``
-    for one to arrive, already claimed (no other session gets it; ``release(claim)`` if it was not typed);
-    ``(None, error, None)`` otherwise. The code is returned to the caller only, never logged."""
+    for one to arrive, already claimed under the reader's key for that message (no other session gets it;
+    ``release(claim)`` if it was certainly not typed); ``(None, error, None)`` otherwise. The code is returned to the
+    caller only, never logged."""
     deadline = time.monotonic() + max(0, min(int(wait_s), _MAX_WAIT_S))
     while True:
-        left = max(0.0, deadline - time.monotonic())
-        newest, err = _read(str(cfg.get("socket") or "").strip(), inbox, sender, int(left))
+        newest, err = _read(str(cfg.get("socket") or "").strip(), inbox, sender,
+                            int(max(0.0, deadline - time.monotonic())))
         if err or newest is None or time.time() - newest["received_at"] > MAX_AGE_S:
             return None, err, None
-        claim = used_key(inbox, newest["code"], newest["received_at"])
         with _used_lock:
-            if claim not in _used:
-                _used[claim] = newest["received_at"]
-                return newest["code"], None, claim
-        if left <= 1:  # another session claimed this one in the meantime: wait for the next mail, if time is left
+            if newest["key"] not in _used:
+                _used[newest["key"]] = newest["received_at"]
+                return newest["code"], None, newest["key"]
+        # another session claimed this mail while we read it; the reader skips it from now on
+        if deadline - time.monotonic() <= 1:
             return None, None, None
-        time.sleep(1)  # the reader skips the claim now; a second apart, so one that can't (an older copy) isn't hammered
+        time.sleep(1)
 
 
 def release(claim: Optional[str]) -> None:

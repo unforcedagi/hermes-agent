@@ -23,7 +23,8 @@ Request, one JSON line: {"address": "...", "sender": "acme.com | no-reply@acme.c
   the reader waits up to ``wait_s`` for new mail (JMAP on its own account: the server's push stream; a shared Inbox,
   which gets no push, and AgentMail: every 5 s); it never falls back to an older message, whose code a resend has
   replaced.
-Reply, one JSON line: {"candidates": [{"code": "...", "received_at": <epoch>, "from": "..."}]} (at most one), or
+Reply, one JSON line: {"candidates": [{"code": "...", "received_at": <epoch>, "from": "...", "key": "<skip key>"}]}
+                      (at most one; ``key`` is what to send in ``skip`` once the code is used), or
                       {"error": "..."}. Nothing else is ever sent: no body, link or subject.
 Each request writes one audit line to stderr (the journal): who asked, which inbox and sender, and the outcome. Never
 the code. Stdlib only, so it runs under ``python3 -I``.
@@ -249,6 +250,11 @@ def candidates(messages: Iterable[tuple], sender: str, since: float) -> List[dic
     return []
 
 
+def used_key(address: str, code: str, received_at: float) -> str:
+    """The skip key for one message's code (the reply carries it, so Hermes never computes its own)."""
+    return hashlib.sha256(f"{address}:{code}@{int(received_at)}".encode()).hexdigest()
+
+
 def _pairs(values: List[str], flag: str) -> dict:
     out = {}
     for v in values or []:
@@ -330,7 +336,9 @@ def serve(args: argparse.Namespace, line: bytes, uid: Optional[int]) -> int:
         settle = 0  # after a push the new mail can take a moment to become searchable: a few quick re-queries
         while True:
             found = candidates(messages(time.time() - max_age), sender, time.time() - max_age)
-            if found and hashlib.sha256(f"{address}:{found[0]['code']}@{int(found[0]['received_at'])}".encode()).hexdigest() in skip:
+            if found:
+                found[0]["key"] = used_key(address, found[0]["code"], found[0]["received_at"])
+            if found and found[0]["key"] in skip:
                 found = []  # the newest code was already used: only a newer mail can answer
             left = deadline - time.monotonic()
             if found or left <= 0:

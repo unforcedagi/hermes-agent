@@ -254,7 +254,7 @@ def test_two_sessions_reading_one_mail_type_it_once(mailbox, monkeypatch):
     """Both sessions' requests reached the reader before either claimed (so it answered both with the same mail):
     only the first types it; the second keeps waiting for the next mail, then says none came."""
     at = time.time() - 30
-    same = json.dumps({"candidates": [{"code": "482913", "received_at": at, "from": "no-reply@acme.test"}]})
+    same = json.dumps({"candidates": [{"code": "482913", "received_at": at, "from": "no-reply@acme.test", "key": "b" * 64}]})
     cfg = {**own.own_inbox_config(), "socket": _canned(same)[0]}
     first = own.fetch_code(INBOX, "acme.test", 0, cfg)
     started = time.monotonic()
@@ -262,16 +262,17 @@ def test_two_sessions_reading_one_mail_type_it_once(mailbox, monkeypatch):
     assert first[0] == "482913" and second == (None, None, None) and time.monotonic() - started >= 1.5
 
 
-def test_a_fill_that_throws_gives_the_code_back(mailbox):
+def test_a_fill_that_throws_keeps_the_code_claimed_and_is_audited(mailbox, caplog):
+    """The fill may have reached the page before it threw (a timeout): that message's code is never typed again."""
     mailbox.messages = [{"from": "no-reply@acme.test", "subject": "Code", "body": "Your code is 318264", "at": time.time() - 30}]
     with patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None), \
          patch.object(browser_vault_tool, "_eval_js", side_effect=lambda t, e: {"success": True, "result": json.dumps(OTP_BOX) if "querySelectorAll" in e else "https://acme.test/2fa"}), \
          patch.object(browser_vault_tool, "_eval_js_secret", side_effect=RuntimeError("supervisor went away")), \
-         pytest.raises(RuntimeError):
+         caplog.at_level(logging.INFO, logger=own.__name__), pytest.raises(RuntimeError):
         browser_vault_tool.browser_vault_enter_code(task_id="t", source="own_inbox", wait_s=0, site="https://acme.test", sender="acme.test")
-    assert own._used == {}
+    assert "fill failed (unknown whether typed)" in caplog.text and len(own._used) == 1
     out, _, typed = _enter(site="https://acme.test", sender="acme.test")
-    assert out["success"] and typed == ["318264"]
+    assert out["error_type"] == "no_code_found" and typed == []
 
 
 def test_a_resent_mail_with_the_same_code_is_typed_again(mailbox):
@@ -320,7 +321,8 @@ def test_code_extraction(subject, body, code):
 
 
 def test_hermes_enforces_the_ten_minutes_whatever_the_reader_returns(mailbox, monkeypatch):
-    stale = json.dumps({"candidates": [{"code": "246810", "received_at": time.time() - 900, "from": "a@acme.test"}]})
+    stale = json.dumps({"candidates": [{"code": "246810", "received_at": time.time() - 900, "from": "a@acme.test",
+                                        "key": "a" * 64}]})
     cfg = {**own.own_inbox_config(), "socket": _canned(stale)[0]}
     monkeypatch.setattr(own, "own_inbox_config", lambda: cfg)
     out, _, typed = _enter(site="https://acme.test", sender="acme.test")
@@ -328,7 +330,8 @@ def test_hermes_enforces_the_ten_minutes_whatever_the_reader_returns(mailbox, mo
 
 
 @pytest.mark.parametrize("reply", ["null", "[1, 2]", '{"candidates": [{"code": "1234", "received_at": "yesterday"}]}', "not json",
-                                   '{"candidates": [{"code": "None", "received_at": 9999999999}]}'])
+                                   '{"candidates": [{"code": "None", "received_at": 9999999999}]}',
+                                   '{"candidates": [{"code": "123456", "received_at": 9999999999}]}'])  # no key: an older reader
 def test_a_malformed_reader_reply_is_a_clean_refusal(mailbox, monkeypatch, reply):
     cfg = {**own.own_inbox_config(), "socket": _canned(reply)[0]}
     monkeypatch.setattr(own, "own_inbox_config", lambda: cfg)
@@ -384,3 +387,16 @@ def test_the_retired_reader_command_is_never_run_and_says_so_once(monkeypatch, c
     with caplog.at_level(logging.WARNING, logger=own.__name__):
         assert own.own_inbox_addresses(cfg) == [] and own.own_inbox_addresses(cfg) == []
     assert caplog.text.count("vault.own_inbox.reader is no longer read") == 1
+
+
+def test_a_fill_that_typed_nothing_gives_the_code_back(mailbox):
+    """The fill ran but found nothing to type into (the page moved on): the code was certainly not typed, so the next
+    call may use it."""
+    mailbox.messages = [{"from": "no-reply@acme.test", "subject": "Code", "body": "Your code is 318264", "at": time.time() - 30}]
+    with patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None), \
+         patch.object(browser_vault_tool, "_eval_js", side_effect=lambda t, e: {"success": True, "result": json.dumps(OTP_BOX) if "querySelectorAll" in e else "https://acme.test/2fa"}), \
+         patch.object(browser_vault_tool, "_eval_js_secret", return_value={"success": True, "result": json.dumps({"filled": 0})}):
+        none = json.loads(browser_vault_tool.browser_vault_enter_code(task_id="t", source="own_inbox", wait_s=0,
+                                                                      site="https://acme.test", sender="acme.test"))
+    out, _, typed = _enter(site="https://acme.test", sender="acme.test")
+    assert none["success"] is False and out["success"] and typed == ["318264"]
