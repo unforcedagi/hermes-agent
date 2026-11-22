@@ -113,6 +113,8 @@ async def test_message_during_restart_drain_is_answered_after_restart(home):
     await _settle(first)
     assert len(relay.sent) == 2
 
+    await first.disconnect()  # a real shutdown disconnects; life 2 reads the cursor file it leaves
+
     # Life 2: a new process, same HERMES_HOME. The held message is delivered; nothing else is.
     second = _adapter(relay)
     answered = []
@@ -200,3 +202,34 @@ async def test_a_part_that_cannot_be_replayed_holds_nothing(home):
     assert adapter.hold_for_restart([good, no_copy]) is False
     saved = json.loads((home / "buzz" / "channel-cursors.json").read_text())["channels"][CHANNEL]
     assert "ok" in saved["seen"] and saved["last_ts"] == 400
+
+
+@pytest.mark.asyncio
+async def test_a_held_reply_to_the_bot_without_a_mention_is_answered_after_restart(home):
+    """A reply to the bot's own post is addressed to it, but life 2 restores the cursor without reading history,
+    so it no longer knows whose post the parent was. The hold must still be kept."""
+    relay = FakeRelay()
+    relay.events.append({"id": "bot-post", "pubkey": SELF_PUBKEY, "content": "Done: the report is up.",
+                         "created_at": 100, "kind": 9, "tags": [["h", CHANNEL]]})
+    first = _adapter(relay)
+    await _start(first)  # seeded from history: knows bot-post is ours
+    runner = _draining_runner(first)
+    first.set_message_handler(runner._handle_message)
+    relay.events.append({"id": "reply", "pubkey": SENDER, "content": "thanks, one question", "created_at": 200,
+                         "kind": 9, "tags": [["h", CHANNEL], ["e", "bot-post", "", "reply"]]})
+    await first._poll_channel(CHANNEL)
+    await _settle(first)
+    assert any("when it's back" in reply for reply in relay.sent), relay.sent
+    await first.disconnect()
+
+    second = _adapter(relay)
+    answered = []
+
+    async def gateway(event: MessageEvent):
+        answered.append(event.message_id)
+
+    second.set_message_handler(gateway)
+    await _start(second)
+    await second._poll_channel(CHANNEL)
+    await _settle(second)
+    assert answered == ["reply"]

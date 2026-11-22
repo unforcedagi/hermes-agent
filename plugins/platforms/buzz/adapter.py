@@ -1301,8 +1301,10 @@ class BuzzAdapter(BasePlatformAdapter):
                 logger.warning("Buzz: poll sweep failed", exc_info=True)
 
     def _new_channel_state(self, chat_type: str) -> dict:
-        # ``held``: event id -> created_at for messages handed back during a restart drain (see hold_for_restart).
-        return {"chat_type": chat_type, "last_ts": 0, "seen": OrderedDict(), "event_meta": OrderedDict(), "held": {}}
+        # ``held``: event id -> created_at for messages handed back during a restart drain (see hold_for_restart);
+        # ``replay``: ids a previous process held, which passed the mention gate there and are owed an answer.
+        return {"chat_type": chat_type, "last_ts": 0, "seen": OrderedDict(), "event_meta": OrderedDict(), "held": {},
+                "replay": set()}
 
     # ── Durable channel cursors ───────────────────────────────────────────
 
@@ -1332,9 +1334,11 @@ class BuzzAdapter(BasePlatformAdapter):
                 last_ts = int(entry.get("last_ts") or 0)
             except (TypeError, ValueError):
                 continue
-            raw_seen = entry.get("seen")
+            raw_seen, raw_held = entry.get("seen"), entry.get("held")
             seen = [str(event_id) for event_id in raw_seen][-_SEEN_CAP:] if isinstance(raw_seen, list) else []
-            self._restored_cursors[str(channel_id)] = {"chat_type": str(entry.get("chat_type") or ""), "last_ts": last_ts, "seen": seen}
+            held = {str(event_id) for event_id in raw_held} if isinstance(raw_held, list) else set()
+            self._restored_cursors[str(channel_id)] = {"chat_type": str(entry.get("chat_type") or ""), "last_ts": last_ts,
+                                                       "seen": seen, "held": held}
 
     def _save_cursors(self) -> None:
         """Persist every watched channel's cursor.  Never raises.
@@ -1350,6 +1354,8 @@ class BuzzAdapter(BasePlatformAdapter):
                 "chat_type": state.get("chat_type") or "group",
                 "last_ts": min(last_ts, *held.values()) if held else last_ts,
                 "seen": [event_id for event_id in state.get("seen") or () if event_id not in held],
+                # owed an answer: the next process skips the mention gate for these (it may not know the reply parent)
+                "held": sorted(set(held) | set(state.get("replay") or ())),
             }
         payload = {"identity": self._self_pubkey, "relay": self.relay_url, "channels": channels}
         try:
@@ -1398,6 +1404,7 @@ class BuzzAdapter(BasePlatformAdapter):
         state = self._new_channel_state(restored["chat_type"] or chat_type)
         state["last_ts"] = restored["last_ts"]
         state["seen"] = OrderedDict((event_id, None) for event_id in restored["seen"])
+        state["replay"] = set(restored.get("held") or ()) - set(state["seen"])
         self._channel_state[channel_id] = state
         return True
 
@@ -1653,7 +1660,10 @@ class BuzzAdapter(BasePlatformAdapter):
         reply_to_is_own = bool(reply_meta is not None and reply_meta[0] == self._self_pubkey)
         # Channels dispatch only when addressed (@mention or p-tag) or replying to us (Signal/WhatsApp parity),
         # unless require_mention is off. DMs always dispatch.
-        if not is_dm and self.require_mention and not self._is_addressed(event) and not reply_to_is_own:
+        # A message held by the previous process passed this gate there; a restored cursor may not know its reply parent.
+        owed = event_id in state.get("replay", ())
+        state.get("replay", set()).discard(event_id)
+        if not is_dm and self.require_mention and not owed and not self._is_addressed(event) and not reply_to_is_own:
             return
         # Adapter-level allow-list (gateway also applies it centrally); empty = no filter.
         if self._allowed_pubkeys and pubkey not in self._allowed_pubkeys:
