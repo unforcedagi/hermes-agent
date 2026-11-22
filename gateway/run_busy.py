@@ -94,6 +94,29 @@ class GatewayBusySessionMixin:
             return False
         return adapter.hold_for_restart(event.parts())
 
+    def _hold_queue_for_restart(
+        self, session_key: Optional[str], adapter: Any, pending_event: Optional[MessageEvent]
+    ) -> bool:
+        """At the end of a turn during a drain: hold every follow-up still queued for the session.
+
+        Covers the dequeued ``pending_event``, the overflow item ``_promote_queued_event`` staged in
+        the adapter slot, and the rest of the overflow. Each held item leaves its queue (it comes back
+        from the platform after the restart); one that can't be held stays where it was. Returns
+        whether ``pending_event`` was held.
+        """
+        held = pending_event is not None and self._hold_for_restart(pending_event)
+        if not session_key:
+            return held
+        slot = getattr(adapter, "_pending_messages", None)
+        staged = slot.get(session_key) if isinstance(slot, dict) else None
+        if staged is not None and self._hold_for_restart(staged):
+            slot.pop(session_key, None)
+        overflow = self._overflow_queue(session_key)
+        for queued in list(overflow or ()):
+            if self._hold_for_restart(queued):
+                overflow.remove(queued)
+        return held
+
     def _held_for_restart_notice(self) -> str:
         return f"⏳ Gateway is {self._status_action_gerund()} — I'll answer this when it's back."
 

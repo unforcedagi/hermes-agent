@@ -130,7 +130,8 @@ async def test_message_during_restart_drain_is_answered_after_restart(home):
 
 
 @pytest.mark.asyncio
-async def test_follow_ups_queued_before_the_drain_are_all_held(home):
+@pytest.mark.parametrize("head", ["merged follow-ups", "a slash command"])
+async def test_follow_ups_queued_before_the_drain_are_all_held(home, head):
     relay = FakeRelay()
     first = _adapter(relay)
     await _start(first)
@@ -153,8 +154,14 @@ async def test_follow_ups_queued_before_the_drain_are_all_held(home):
         return MessageEvent(text=raw[event_id]["content"], source=source, message_id=event_id,
                             raw_message=raw[event_id])
 
-    for event_id in ("q1", "q2"):
-        merge_pending_message_event(first._pending_messages, session_key, queued(event_id), merge_text=True)
+    if head == "a slash command":
+        # A queued command is never held or run after the turn; the follow-ups behind it still must be.
+        first._pending_messages[session_key] = MessageEvent(text="/model x", source=source, message_id="cmd")
+        expected = ["q3", "q4"]
+    else:
+        for event_id in ("q1", "q2"):
+            merge_pending_message_event(first._pending_messages, session_key, queued(event_id), merge_text=True)
+        expected = ["q1", "q2", "q3", "q4"]
     for event_id in ("q3", "q4"):
         runner._enqueue_fifo(session_key, queued(event_id), first)
     assert len(runner._overflow_queue(session_key)) == 2
@@ -172,7 +179,9 @@ async def test_follow_ups_queued_before_the_drain_are_all_held(home):
     await _start(second)
     await second._poll_channel(CHANNEL)
     await _settle(second)
-    assert sorted(answered) == ["q1", "q2", "q3", "q4"]
+    if head == "a slash command":
+        answered = [event_id for event_id in answered if event_id in expected]  # q1, q2 were never queued
+    assert sorted(answered) == expected
 
 
 @pytest.mark.asyncio

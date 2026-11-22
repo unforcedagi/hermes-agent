@@ -2,7 +2,7 @@
 
 Two parts, independent. Do the memory guard first: it needs no restart.
 
-## 1. Memory guard (uni-ops 26b6dee) — Uni runs it, live, no restart
+## 1. Memory guard (uni-ops master, 26b6dee and the review fixes after it) — Uni runs it, live, no restart
 
     ~/Code/uni-ops/memory/apply
 
@@ -23,7 +23,7 @@ the running mts workers to 900 (`choom`, unprivileged), then runs the check. Not
 - Trade-off to know: a burst of workers that holds heavy.slice at its 64G ceiling until 30% stalled now loses its
   biggest worker (mts records it failed); before, it only slowed.
 
-## 2. Hermes: hold instead of refuse (branch fix/restart-hold, commit on top of plugin-inject-origin)
+## 2. Hermes: hold instead of refuse (branch fix/restart-hold, on top of plugin-inject-origin d4af37521d)
 
 Uni merges the branch into the fork and pushes it (fork pushes are Uni's). Then the gateway needs one restart to load
 the code; Uni asks Aaron for it.
@@ -34,5 +34,5 @@ the code; Uni asks Aaron for it.
   long turn runs elsewhere). The reply is "⏳ Gateway is restarting — I'll answer this when it's back.", the
   gateway log has `Buzz: holding message … until the gateway is back`, and after the restart the message gets a real
   answer. `~/.hermes/buzz/channel-cursors.json` keeps the held id out of `seen` until then.
-- Undo: revert the commit on the fork and restart the gateway once more.
+- Undo: revert the branch's T-487 commits (`git revert --no-edit d4af37521d..<merged tip>`) and restart the gateway once more.
 - Tests: `scripts/run_tests.sh tests/gateway/test_buzz_restart_hold.py` (fails on the old code, passes on the new).

@@ -15,5 +15,12 @@
   tests/gateway + tests/plugins/platforms/buzz: 171 failures, all in 54 files that fail the same on base
   (missing optional deps in the worktree venv: telegram, discord, ...). No new failures.
 
+- Part 2 committed in uni-ops (26b6dee, a96e091 and the second-review fix): drop-ins, memory/apply, memory/check,
+  memory/pressure-test (all 8 control/guarded checks pass on throwaway t487* units).
+- Two code reviews; fixes: all-or-nothing hold, staged slot + overflow held by one run_busy helper on every drain
+  (also when a queued command cleared the pending item), rewrite keeps merged parts; apply/check never walk an
+  empty cgroup path, gateway main process only, check covers every gateway.
+- DEPLOY.md, WALKTHROUGH.md, docs (updating.md, messaging/index.md).
+
 ## Next
-- Part 2: uni-ops memory drop-ins, throwaway-unit pressure test, DEPLOY.md.
+- /verify, final review, report. Nothing applied live (Uni runs memory/apply; Aaron restarts the gateway).

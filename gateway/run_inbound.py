@@ -96,7 +96,7 @@ class GatewayInboundMixin:
                 _new_text = _result.get("text")
                 if isinstance(_new_text, str):
                     _rewritten = dataclasses.replace(event, text=_new_text)
-                    _rewritten._absorbed = event._absorbed  # init=False: replace() would drop the merged parts
+                    _rewritten._absorbed = list(event._absorbed)  # init=False: replace() would drop the merged parts
                     event = _rewritten
                 break
             if _action == "allow":
