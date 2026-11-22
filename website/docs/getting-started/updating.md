@@ -46,7 +46,7 @@ When you run `hermes update`, the following steps occur:
 
 ### Why the gateway restart can take a while
 
-The restart is drain-first: the running gateway refuses new turns, then waits for in-flight work (chat turns, cron jobs, API runs) to finish before exiting, capped by `agent.restart_after_turn_timeout` (30 minutes by default) so a long-running job is never cut off mid-run. While that wait is in progress the updater prints, every 30 seconds, what the gateway is still holding for — for example:
+The restart is drain-first: the running gateway starts no new turns, then waits for in-flight work (chat turns, cron jobs, API runs) to finish before exiting, capped by `agent.restart_after_turn_timeout` (30 minutes by default) so a long-running job is never cut off mid-run. A chat message that arrives meanwhile is held when its platform can deliver it again (Buzz: the relay keeps it and the restored cursor replays it), so it is answered after the restart; on other platforms it is refused. While that wait is in progress the updater prints, every 30 seconds, what the gateway is still holding for — for example:
 
 ```
   → hermes-gateway: draining (up to 1875s)...
