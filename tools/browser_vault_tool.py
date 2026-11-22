@@ -561,6 +561,8 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, se
     except BaseException:
         if source == "own_inbox":
             own.release(claim)  # nothing reached the page
+        with contextlib.suppress(Exception):
+            _unstamp(effective_task_id, {})
         raise
     try:
         result = _eval_js_secret(effective_task_id, fill_js)
