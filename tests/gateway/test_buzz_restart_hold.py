@@ -305,3 +305,56 @@ async def test_an_expired_hold_stops_pinning_the_cursor(home, monkeypatch):
     await second._poll_channel(CHANNEL)
     await _settle(second)
     assert answered == []
+
+
+@pytest.mark.asyncio
+async def test_a_hold_lands_in_the_adapters_own_profile_home(tmp_path, monkeypatch):
+    """A hold can be called from runner code bound to another profile (a routed turn ending); the cursor it writes
+    must be the one this adapter reads at its next start, never another profile's."""
+    home_a, home_b = tmp_path / "a", tmp_path / "b"
+    home_a.mkdir(); home_b.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home_a))
+    relay = FakeRelay()
+    adapter = _adapter(relay)
+    await _start(adapter)
+    relay.post("held", "@Chip there?", 200)
+    await adapter._handle_events(CHANNEL, adapter._channel_state[CHANNEL], list(relay.events))
+    source = adapter.build_source(chat_id=CHANNEL, chat_type="group", user_id=SENDER)
+
+    monkeypatch.setenv("HERMES_HOME", str(home_b))
+    held = MessageEvent(text="there?", source=source, message_id="held", raw_message=relay.events[0])
+    assert adapter.hold_for_restart([held]) is True
+
+    import json
+    saved = json.loads((home_a / "buzz" / "channel-cursors.json").read_text())["channels"][CHANNEL]
+    assert "held" in saved["held"]
+    assert not (home_b / "buzz").exists()
+
+
+@pytest.mark.asyncio
+async def test_the_websocket_resume_asks_from_the_held_message_with_no_limit(home):
+    """The live gateway reads Buzz over the websocket: after a restart its subscription must start at or before the
+    held message and carry no limit, so a busy room can't push the held message out of the first batch."""
+    import json
+    relay = FakeRelay()
+    first = _adapter(relay)
+    await _start(first)
+    first.set_message_handler(_draining_runner(first)._handle_message)
+    relay.post("held", "@Chip there?", 200)
+    for n in range(60):
+        relay.post(f"busy{n}", "chatter", 300 + n)
+    await first._poll_channel(CHANNEL)
+    await _settle(first)
+    await first.disconnect()
+
+    second = _adapter(relay)
+    await _start(second)
+    sent = []
+
+    class Socket:
+        async def send(self, frame):
+            sent.append(json.loads(frame))
+
+    await second._send_channel_subscription(Socket(), "sub-0", CHANNEL)
+    request = sent[0][2]
+    assert request["since"] <= T0 + 200 and "limit" not in request

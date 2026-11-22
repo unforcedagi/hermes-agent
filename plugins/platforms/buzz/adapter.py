@@ -575,6 +575,9 @@ class BuzzAdapter(BasePlatformAdapter):
         self._channel_state: Dict[str, dict] = {}
         # Cursors read from disk at connect(), consumed by each channel's first seed.
         self._restored_cursors: Dict[str, dict] = {}
+        # This adapter's own cursor file, fixed when connect() loads it (in this adapter's profile scope): a hold
+        # can be written from runner code bound to another profile, and must land where this adapter reads.
+        self._cursor_file: Optional[Path] = None
         self._channel_names: Dict[str, str] = {}
         # channel_id -> raw ``channels list`` entry; drives DM-vs-channel classification.
         self._channel_meta: Dict[str, dict] = {}
@@ -1318,8 +1321,9 @@ class BuzzAdapter(BasePlatformAdapter):
     def _load_cursors(self) -> None:
         """Read persisted cursors; another identity/relay's file is ignored (ids collide), failures seed from history."""
         self._restored_cursors = {}
+        self._cursor_file = self._cursor_path()
         try:
-            if not (path := self._cursor_path()).exists():
+            if not (path := self._cursor_file).exists():
                 return
             data = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
@@ -1375,7 +1379,7 @@ class BuzzAdapter(BasePlatformAdapter):
         payload = {"identity": self._self_pubkey, "relay": self.relay_url, "channels": channels}
         try:
             from utils import atomic_json_write
-            atomic_json_write(self._cursor_path(), payload, indent=None)
+            atomic_json_write(self._cursor_file or self._cursor_path(), payload, indent=None)
         except Exception:
             logger.debug("Buzz: could not persist channel cursors", exc_info=True)
             return False
