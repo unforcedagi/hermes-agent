@@ -22,5 +22,10 @@
   empty cgroup path, gateway main process only, check covers every gateway.
 - DEPLOY.md, WALKTHROUGH.md, docs (updating.md, messaging/index.md).
 
+- Reviews 3 and 4 fixed: held ids saved with when they were held, pin the cursor in every life until re-read,
+  expire 6 h after the hold; held reply-only messages skip the mention gate in the next life; unadopted DMs keep
+  their cursor. pressure-test: per-slice ceilings (load-independent), omit-only scenario, staged-change guard before
+  every reload. apply --undo reverts only what apply set.
+
 ## Next
-- /verify, final review, report. Nothing applied live (Uni runs memory/apply; Aaron restarts the gateway).
+- Final review + /verify; report. Nothing applied live (Uni runs memory/apply; Aaron restarts the gateway).

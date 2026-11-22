@@ -21,7 +21,8 @@ the running mts workers to 900 (`choom`, unprivileged), then runs the check. Not
 - Trade-off to know: `omit` also covers the gateway's tool subprocesses, so a runaway tool under the gateway is left
   to the kernel (which still takes it first) while oomd takes Matrix or core.
 - Trade-off to know: a burst of workers that holds heavy.slice at its 64G ceiling until 30% stalled now loses its
-  biggest worker (mts records it failed); before, it only slowed.
+  biggest worker (mts records it failed); before, it only slowed. Measured 11-22 11:2x: heavy.slice at 34 GB had
+  memory pressure 0.00 (avg10/60/300; 0.1 s of stall since boot), so 30% is far above normal load.
 
 ## 2. Hermes: hold instead of refuse (branch fix/restart-hold, on top of plugin-inject-origin d4af37521d)
 
@@ -33,6 +34,7 @@ the code; Uni asks Aaron for it.
 - Check after the restart: send a message in a test room while a restart drains (for example `/restart` while a
   long turn runs elsewhere). The reply is "⏳ Gateway is restarting — I'll answer this when it's back.", the
   gateway log has `Buzz: holding message … until the gateway is back`, and after the restart the message gets a real
-  answer. `~/.hermes/buzz/channel-cursors.json` keeps the held id out of `seen` until then.
+  answer. `~/.hermes/buzz/channel-cursors.json` lists it under the channel's `held` (with when it was held) and keeps it out of
+  `seen` until a start re-reads it. A hold no start re-reads within 6 h is let go.
 - Undo: revert the branch's T-487 commits (`git revert --no-edit d4af37521d..<merged tip>`) and restart the gateway once more.
 - Tests: `scripts/run_tests.sh tests/gateway/test_buzz_restart_hold.py` (fails on the old code, passes on the new).
