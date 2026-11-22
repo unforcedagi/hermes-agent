@@ -19,7 +19,6 @@ transcript. Limits, all enforced here:
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import re
@@ -34,9 +33,9 @@ MAX_AGE_S = 600
 _MAX_WAIT_S = 120
 _CODE = re.compile(r"[0-9]{4,8}")  # what a reader may hand back: anything else is refused, never typed
 _KEY = re.compile(r"[0-9a-f]{64}")
-# Codes taken from a mail, keyed by the reader's key for that message (inbox, code, received_at) -> received_at: one message's code is typed once (a
-# resend of the same code in a new mail is a new key), and is claimed before it is typed so two sessions never type
-# the same one. Process-wide on purpose: the inboxes belong to the machine, not to a profile. A key is dropped once its
+# Codes taken from a mail, keyed by the reader's key for that message (inbox, code, received_at) -> received_at: one
+# message's code is typed once (a resend of the same code in a new mail is a new key), and is claimed before it is
+# typed so two sessions never type the same one. Process-wide on purpose: the inboxes belong to the machine, not to a profile. A key is dropped once its
 # mail is older than the reader's window, so the list holds minutes of mail, however long the gateway runs.
 _used: Dict[str, float] = {}
 _used_lock = threading.Lock()
@@ -173,7 +172,8 @@ def _read(sock_path: str, inbox: str, sender: str, wait_s: int) -> Tuple[Optiona
     try:
         code, received_at, key = str(newest["code"]), float(newest["received_at"]), str(newest["key"])
     except (TypeError, KeyError, ValueError):
-        return None, "the inbox reader failed: a reply without a code, a numeric received_at and a key"
+        return None, ("the inbox reader failed: a reply without a code, a numeric received_at and a key (a reader "
+                      "older than this Hermes: the machine's admin reinstalls it from this checkout)")
     if not _CODE.fullmatch(code):
         return None, "the inbox reader failed: what it returned is not a 4-8 digit code"
     if not _KEY.fullmatch(key):

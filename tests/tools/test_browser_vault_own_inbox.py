@@ -270,7 +270,7 @@ def test_a_fill_that_throws_keeps_the_code_claimed_and_is_audited(mailbox, caplo
          patch.object(browser_vault_tool, "_eval_js_secret", side_effect=RuntimeError("supervisor went away")), \
          caplog.at_level(logging.INFO, logger=own.__name__), pytest.raises(RuntimeError):
         browser_vault_tool.browser_vault_enter_code(task_id="t", source="own_inbox", wait_s=0, site="https://acme.test", sender="acme.test")
-    assert "fill failed (unknown whether typed)" in caplog.text and len(own._used) == 1
+    assert "fill failed, code kept (unknown whether typed)" in caplog.text and len(own._used) == 1
     out, _, typed = _enter(site="https://acme.test", sender="acme.test")
     assert out["error_type"] == "no_code_found" and typed == []
 
@@ -389,13 +389,16 @@ def test_the_retired_reader_command_is_never_run_and_says_so_once(monkeypatch, c
     assert caplog.text.count("vault.own_inbox.reader is no longer read") == 1
 
 
-def test_a_fill_that_typed_nothing_gives_the_code_back(mailbox):
-    """The fill ran but found nothing to type into (the page moved on): the code was certainly not typed, so the next
-    call may use it."""
+@pytest.mark.parametrize("fill", [{"success": True, "result": json.dumps({"filled": 0})},
+                                  {"success": False, "error_type": "supervisor_required", "error": "no supervisor"}],
+                         ids=["typed-nothing", "never-reached-the-page"])
+def test_a_fill_that_typed_nothing_gives_the_code_back(mailbox, fill):
+    """The fill ran but found nothing to type into (the page moved on), or never reached the page: the code was
+    certainly not typed, so the next call may use it."""
     mailbox.messages = [{"from": "no-reply@acme.test", "subject": "Code", "body": "Your code is 318264", "at": time.time() - 30}]
     with patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None), \
          patch.object(browser_vault_tool, "_eval_js", side_effect=lambda t, e: {"success": True, "result": json.dumps(OTP_BOX) if "querySelectorAll" in e else "https://acme.test/2fa"}), \
-         patch.object(browser_vault_tool, "_eval_js_secret", return_value={"success": True, "result": json.dumps({"filled": 0})}):
+         patch.object(browser_vault_tool, "_eval_js_secret", return_value=fill):
         none = json.loads(browser_vault_tool.browser_vault_enter_code(task_id="t", source="own_inbox", wait_s=0,
                                                                       site="https://acme.test", sender="acme.test"))
     out, _, typed = _enter(site="https://acme.test", sender="acme.test")

@@ -26,6 +26,7 @@ autofill (kernel-login-autofill.ts / fill_from_vault.ts).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import secrets
@@ -556,22 +557,31 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, se
 
     try:
         register_vault_redaction_value(code)
-        fills = build_otp_fills(otp_controls, code)
-        result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
+        fill_js = build_fill_js(build_otp_fills(otp_controls, code), expected_origin=origin, nonce=nonce)
+    except BaseException:
+        if source == "own_inbox":
+            own.release(claim)  # nothing reached the page
+        raise
+    try:
+        result = _eval_js_secret(effective_task_id, fill_js)
     except BaseException:
         # It may have reached the page (a timeout after the fill ran): an own-inbox code stays claimed, never typed twice.
         if source == "own_inbox":
-            own.audit("fill failed (unknown whether typed)", origin, basis, inbox, sender)
-        _unstamp(effective_task_id, {})
+            own.audit("fill failed, code kept (unknown whether typed)", origin, basis, inbox, sender)
+        with contextlib.suppress(Exception):  # the fill's own error is the one to report
+            _unstamp(effective_task_id, {})
         raise
     parsed = _parse_json_result(result.get("result")) if result.get("success") else None
     if isinstance(parsed, str):
         parsed = _parse_json_result(parsed)
     filled = int(parsed.get("filled", 0)) if isinstance(parsed, dict) and str(parsed.get("filled", 0)).isdigit() else 0
     if source == "own_inbox":
-        if not filled and result.get("success"):
-            own.release(claim)  # the fill ran and typed nothing (no field, page moved on): the next call may use it
-        own.audit("entered" if filled else "fill failed", origin, basis, inbox, sender)
+        # Given back only when it certainly was not typed: the fill ran and typed nothing, or never reached the page.
+        untyped = not filled and (result.get("success") or result.get("error_type") == "supervisor_required")
+        if untyped:
+            own.release(claim)
+        own.audit("entered" if filled else "fill failed, code given back" if untyped else "fill failed, code kept",
+                  origin, basis, inbox, sender)
     del code
     if not result.get("success"):
         return json.dumps({"success": False, "error": str(result.get("error") or "fill failed")[:200]})
