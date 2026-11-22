@@ -28,4 +28,5 @@
   every reload. apply --undo reverts only what apply set.
 
 ## Next
-- Done: sixth review clean; final verify ran (see report). Report. Nothing applied live (Uni runs memory/apply; Aaron restarts the gateway).
+- Done: profile-home fix (41044c7c1d) reviewed clean; verify after it: buzz 295/295, drain files 134/134 with
+  messaging extras, gateway suite halves (failures = load flakes or same on base), pressure-test kernel/policy/choom ALL PASS. Nothing applied live (Uni runs memory/apply; Aaron restarts the gateway).
