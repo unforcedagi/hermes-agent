@@ -3920,13 +3920,14 @@ class BasePlatformAdapter(ABC):
             raise
         await self._drain_pending_after_session_command(session_key, command_guard)
 
-    def hold_for_restart(self, event: MessageEvent) -> bool:
-        """Give an inbound message back to the platform while the gateway drains for a restart.
+    def hold_for_restart(self, events: List[MessageEvent]) -> bool:
+        """Give inbound messages back to the platform while the gateway drains for a restart.
 
-        True means the platform still holds a durable copy and will deliver this message again
-        after the next start, so the gateway answers it then instead of refusing it now. Only
-        adapters that replay from a durable source (a relay cursor, a server-side update queue)
-        can say yes; the default keeps today's refusal.
+        *events* are the platform messages behind one gateway event (``MessageEvent.parts()``).
+        All or nothing: True means the platform still holds a durable copy of every one and will
+        deliver them again after the next start, so the gateway answers them then instead of
+        refusing them now; False means none was held. Only adapters that replay from a durable
+        source (a relay cursor, a server-side update queue) can say yes; the default refuses.
         """
         return False
 

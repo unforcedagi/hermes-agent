@@ -1358,23 +1358,26 @@ class BuzzAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("Buzz: could not persist channel cursors", exc_info=True)
 
-    def hold_for_restart(self, event: MessageEvent) -> bool:
-        """Leave a relay message unconsumed so the restored cursor delivers it after the restart.
+    def hold_for_restart(self, events: List[MessageEvent]) -> bool:
+        """Leave relay messages unconsumed so the restored cursor delivers them after the restart.
 
         The relay keeps every message, so a message the draining gateway can't take is simply not marked
         read on disk: the next start resumes from before it and dispatches it like any downtime arrival.
         """
-        raw = event.raw_message if isinstance(event.raw_message, dict) else {}
-        event_id = str(raw.get("id") or "")
-        created_at = int(raw.get("created_at") or 0)
-        state = self._channel_state.get(str(event.source.chat_id)) if event.source else None
-        if not event_id or not created_at or state is None:
-            return False
-        state.setdefault("held", {})[event_id] = created_at
+        holds = []
+        for event in events:
+            raw = event.raw_message if isinstance(event.raw_message, dict) else {}
+            event_id, created_at = str(raw.get("id") or ""), int(raw.get("created_at") or 0)
+            state = self._channel_state.get(str(event.source.chat_id)) if event.source else None
+            if not event_id or not created_at or state is None:
+                return False  # all or nothing: one message we can't replay and the caller refuses them all
+            holds.append((state, event_id, created_at, event.source.chat_id))
+        for state, event_id, created_at, chat_id in holds:
+            state.setdefault("held", {})[event_id] = created_at
+            logger.info("Buzz: holding message %s in %s until the gateway is back", event_id[:12],
+                        self._channel_names.get(str(chat_id), chat_id))
         self._save_cursors()
-        logger.info("Buzz: holding message %s in %s until the gateway is back", event_id[:12],
-                    self._channel_names.get(str(event.source.chat_id), event.source.chat_id))
-        return True
+        return bool(holds)
 
     @staticmethod
     def _cursor_mark(state: dict) -> tuple:

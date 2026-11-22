@@ -130,26 +130,34 @@ async def test_message_during_restart_drain_is_answered_after_restart(home):
 
 
 @pytest.mark.asyncio
-async def test_follow_up_queued_before_the_drain_is_held_with_everything_merged_into_it(home):
+async def test_follow_ups_queued_before_the_drain_are_all_held(home):
     relay = FakeRelay()
     first = _adapter(relay)
     await _start(first)
-    for event_id, text, ts in (("q1", "@Chip one more thing", 300), ("q2", "@Chip and another", 301)):
+    for event_id, text, ts in (("q1", "@Chip one more thing", 300), ("q2", "@Chip and another", 301),
+                               ("q3", "@Chip third", 302), ("q4", "@Chip fourth", 303)):
         relay.post(event_id, text, ts)
     raw = {e["id"]: e for e in relay.events}
     # Both were read (and so marked seen) while a turn was busy, before the drain began.
     await first._handle_events(CHANNEL, first._channel_state[CHANNEL], list(raw.values()))
-    assert {"q1", "q2"} <= set(first._channel_state[CHANNEL]["seen"])
+    assert {"q1", "q2", "q3", "q4"} <= set(first._channel_state[CHANNEL]["seen"])
     runner = _draining_runner(first)
 
-    # The busy turn had queued both follow-ups, merged into one pending event, before the drain began.
+    # The busy turn had queued them before the drain began: q1 and q2 merged into the adapter slot, q3 and q4
+    # behind them in the runner's FIFO (q3 gets staged into the slot as the slot drains).
     from gateway.platforms.base import merge_pending_message_event
     source = first.build_source(chat_id=CHANNEL, chat_type="group", user_id=SENDER)
     session_key = runner._session_key_for_source(source)
+
+    def queued(event_id):
+        return MessageEvent(text=raw[event_id]["content"], source=source, message_id=event_id,
+                            raw_message=raw[event_id])
+
     for event_id in ("q1", "q2"):
-        merge_pending_message_event(first._pending_messages, session_key, MessageEvent(
-            text=raw[event_id]["content"], source=source, message_id=event_id, raw_message=raw[event_id]),
-            merge_text=True)
+        merge_pending_message_event(first._pending_messages, session_key, queued(event_id), merge_text=True)
+    for event_id in ("q3", "q4"):
+        runner._enqueue_fifo(session_key, queued(event_id), first)
+    assert len(runner._overflow_queue(session_key)) == 2
     pending_event, pending = await GatewayRunner._run_agent_drain_pending(
         runner, {"final_response": "done"}, first, source, session_key)
     assert (pending_event, pending) == (None, None)
@@ -158,10 +166,28 @@ async def test_follow_up_queued_before_the_drain_is_held_with_everything_merged_
     answered = []
 
     async def gateway(event: MessageEvent):
-        answered.append(event.message_id)
+        answered.extend(part.message_id for part in event.parts())  # later ones merge into a busy turn
 
     second.set_message_handler(gateway)
     await _start(second)
     await second._poll_channel(CHANNEL)
     await _settle(second)
-    assert sorted(answered) == ["q1", "q2"]
+    assert sorted(answered) == ["q1", "q2", "q3", "q4"]
+
+
+@pytest.mark.asyncio
+async def test_a_part_that_cannot_be_replayed_holds_nothing(home):
+    """All or nothing: the runner refuses the whole message, so no part of it may also be replayed later."""
+    import json
+    relay = FakeRelay()
+    relay.post("ok", "@Chip replayable", 400)
+    adapter = _adapter(relay)
+    await _start(adapter)
+    await adapter._handle_events(CHANNEL, adapter._channel_state[CHANNEL], list(relay.events))
+    source = adapter.build_source(chat_id=CHANNEL, chat_type="group", user_id=SENDER)
+    good = MessageEvent(text="replayable", source=source, message_id="ok", raw_message=relay.events[0])
+    no_copy = MessageEvent(text="never on the relay", source=source, message_id="local")
+
+    assert adapter.hold_for_restart([good, no_copy]) is False
+    saved = json.loads((home / "buzz" / "channel-cursors.json").read_text())["channels"][CHANNEL]
+    assert "ok" in saved["seen"] and saved["last_ts"] == 400

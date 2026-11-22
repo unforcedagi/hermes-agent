@@ -3669,6 +3669,11 @@ class GatewayTurnMixin:
             # A follow-up that reached us before the drain began: its platform may still hold it, in
             # which case it is answered after the restart instead of being lost here.
             held = pending_event is not None and self._hold_for_restart(pending_event)
+            # _promote_queued_event may have staged the next overflow item in the adapter slot.
+            slot = getattr(adapter, "_pending_messages", None)
+            staged = slot.get(session_key) if isinstance(slot, dict) and session_key else None
+            if staged is not None and self._hold_for_restart(staged):
+                slot.pop(session_key, None)
             overflow = self._overflow_queue(session_key) if session_key else None
             for queued in list(overflow or ()):
                 if self._hold_for_restart(queued):

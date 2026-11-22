@@ -92,12 +92,7 @@ class GatewayBusySessionMixin:
         adapter = self._delivery_adapter_for(event.source)
         if adapter is None:
             return False
-        parts = event.parts()
-        held = [part for part in parts if adapter.hold_for_restart(part)]
-        if held and len(held) < len(parts):
-            logger.warning("Held %d of %d merged message(s) for %s; the rest can't be replayed",
-                           len(held), len(parts), self._status_action_label())
-        return len(held) == len(parts)
+        return adapter.hold_for_restart(event.parts())
 
     def _held_for_restart_notice(self) -> str:
         return f"⏳ Gateway is {self._status_action_gerund()} — I'll answer this when it's back."

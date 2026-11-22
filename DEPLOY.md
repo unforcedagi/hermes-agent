@@ -7,8 +7,8 @@ Two parts, independent. Do the memory guard first: it needs no restart.
     ~/Code/uni-ops/memory/apply
 
 Installs the drop-ins from `~/Code/uni-ops/memory/dropins/` into `~/.config/systemd/user/`, runs
-`systemctl --user daemon-reload`, sets the running gateway's processes to oom_score_adj 100 and the running mts
-workers' to 900 (`choom`, unprivileged), then runs the check. Nothing restarts.
+`systemctl --user daemon-reload`, sets the running gateway's main process to oom_score_adj 100 and every process of
+the running mts workers to 900 (`choom`, unprivileged), then runs the check. Nothing restarts.
 
 - Check: `~/Code/uni-ops/memory/check` — exit 0 and every line `ok`: gateway `user.oomd_omit` = 1, OOMPolicy
   continue, oom_score_adj 100; heavy.slice watched by oomd at 30.00%/10s; each mts worker's main process at 900;
@@ -18,6 +18,8 @@ workers' to 900 (`choom`, unprivileged), then runs the check. Nothing restarts.
 - Takes effect: oomd marks, heavy.slice's kill rule and OOMPolicy at daemon-reload; OOMScoreAdjust at the next start
   of each unit (apply's choom covers the processes already running).
 - Proof it works, on throwaway units: `~/Code/uni-ops/memory/pressure-test` (about 2 min, never touches live units).
+- Trade-off to know: `omit` also covers the gateway's tool subprocesses, so a runaway tool under the gateway is left
+  to the kernel (which still takes it first) while oomd takes Matrix or core.
 - Trade-off to know: a burst of workers that holds heavy.slice at its 64G ceiling until 30% stalled now loses its
   biggest worker (mts records it failed); before, it only slowed.
 
