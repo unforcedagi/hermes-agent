@@ -93,6 +93,18 @@ class MessageEvent:
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
     # Run-owned final presentation snapshot; never deserialized from ingress metadata.
     _notification_reply_muted: Optional[bool] = field(default=None, init=False, repr=False, compare=False)
+    # Platform messages merged into this one while it waited (text follow-ups, photo bursts). A merge
+    # can rewrite ``message_id``/``text``, so a hand-back for restart needs each original.
+    _absorbed: List["MessageEvent"] = field(default_factory=list, init=False, repr=False, compare=False)
+
+    def absorb(self, other: "MessageEvent") -> None:
+        """Record that *other* (and whatever it had absorbed) was merged into this event."""
+        if other is not self:
+            self._absorbed.extend((other, *other._absorbed))
+
+    def parts(self) -> List["MessageEvent"]:
+        """This event and every platform message merged into it, oldest first."""
+        return [self, *self._absorbed]
 
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""

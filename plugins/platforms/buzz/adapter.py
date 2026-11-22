@@ -1301,7 +1301,8 @@ class BuzzAdapter(BasePlatformAdapter):
                 logger.warning("Buzz: poll sweep failed", exc_info=True)
 
     def _new_channel_state(self, chat_type: str) -> dict:
-        return {"chat_type": chat_type, "last_ts": 0, "seen": OrderedDict(), "event_meta": OrderedDict()}
+        # ``held``: event id -> created_at for messages handed back during a restart drain (see hold_for_restart).
+        return {"chat_type": chat_type, "last_ts": 0, "seen": OrderedDict(), "event_meta": OrderedDict(), "held": {}}
 
     # ── Durable channel cursors ───────────────────────────────────────────
 
@@ -1336,20 +1337,44 @@ class BuzzAdapter(BasePlatformAdapter):
             self._restored_cursors[str(channel_id)] = {"chat_type": str(entry.get("chat_type") or ""), "last_ts": last_ts, "seen": seen}
 
     def _save_cursors(self) -> None:
-        """Persist every watched channel's cursor.  Never raises."""
-        channels = {
-            channel_id: {
-                "chat_type": state.get("chat_type") or "group", "last_ts": int(state.get("last_ts") or 0),
-                "seen": list(state.get("seen") or ()),
+        """Persist every watched channel's cursor.  Never raises.
+
+        A held message is written as not yet seen, and the cursor stops at it, so the next start fetches it
+        again; in this process it stays seen, so it isn't dispatched twice before the restart.
+        """
+        channels = {}
+        for channel_id, state in self._channel_state.items():
+            held = state.get("held") or {}
+            last_ts = int(state.get("last_ts") or 0)
+            channels[channel_id] = {
+                "chat_type": state.get("chat_type") or "group",
+                "last_ts": min(last_ts, *held.values()) if held else last_ts,
+                "seen": [event_id for event_id in state.get("seen") or () if event_id not in held],
             }
-            for channel_id, state in self._channel_state.items()
-        }
         payload = {"identity": self._self_pubkey, "relay": self.relay_url, "channels": channels}
         try:
             from utils import atomic_json_write
             atomic_json_write(self._cursor_path(), payload, indent=None)
         except Exception:
             logger.debug("Buzz: could not persist channel cursors", exc_info=True)
+
+    def hold_for_restart(self, event: MessageEvent) -> bool:
+        """Leave a relay message unconsumed so the restored cursor delivers it after the restart.
+
+        The relay keeps every message, so a message the draining gateway can't take is simply not marked
+        read on disk: the next start resumes from before it and dispatches it like any downtime arrival.
+        """
+        raw = event.raw_message if isinstance(event.raw_message, dict) else {}
+        event_id = str(raw.get("id") or "")
+        created_at = int(raw.get("created_at") or 0)
+        state = self._channel_state.get(str(event.source.chat_id)) if event.source else None
+        if not event_id or not created_at or state is None:
+            return False
+        state.setdefault("held", {})[event_id] = created_at
+        self._save_cursors()
+        logger.info("Buzz: holding message %s in %s until the gateway is back", event_id[:12],
+                    self._channel_names.get(str(event.source.chat_id), event.source.chat_id))
+        return True
 
     @staticmethod
     def _cursor_mark(state: dict) -> tuple:

@@ -3666,9 +3666,17 @@ class GatewayTurnMixin:
                         pending = None
 
         if self._draining and (pending_event or pending):
+            # A follow-up that reached us before the drain began: its platform may still hold it, in
+            # which case it is answered after the restart instead of being lost here.
+            held = pending_event is not None and self._hold_for_restart(pending_event)
+            overflow = self._overflow_queue(session_key) if session_key else None
+            for queued in list(overflow or ()):
+                if self._hold_for_restart(queued):
+                    overflow.remove(queued)
             logger.info(
-                "Discarding pending follow-up for session %s during gateway %s",
-                session_key or "?", self._status_action_label(),
+                "%s pending follow-up for session %s during gateway %s",
+                "Holding for replay" if held else "Discarding", session_key or "?",
+                self._status_action_label(),
             )
             pending_event = None
             pending = None

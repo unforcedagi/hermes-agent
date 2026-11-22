@@ -696,6 +696,8 @@ class GatewayInboundMixin:
             self._hm_merge_pending_for_source(source, _quick_key, event, merge_text=True)  # picked up after start
             return None
         if self._draining:
+            if self._hold_for_restart(event):
+                return self._held_for_restart_notice()
             queue_during_drain = self._queue_during_drain_enabled(effective_busy_input_mode)
             if queue_during_drain:
                 self._queue_or_replace_pending_event(_quick_key, event)
@@ -1026,6 +1028,8 @@ class GatewayInboundMixin:
         """Drain gate, user-defined quick commands (exec/alias) and plugin slash commands →
         ``(handled, result, command)``; an alias quick command rewrites ``command``."""
         if self._draining:
+            if self._hold_for_restart(event):
+                return True, self._held_for_restart_notice(), command
             return True, f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now.", command
 
         # User-defined quick commands (bypass agent loop, no LLM call)

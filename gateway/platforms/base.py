@@ -1743,11 +1743,13 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
             for attr in ("_gateway_pending_stt_text", "_gateway_pending_stt_transcripts"):
                 if hasattr(existing, attr):
                     delattr(existing, attr)
+            existing.absorb(event)
             return
         both_text = existing_type == MessageType.TEXT and event.message_type == MessageType.TEXT
         if merge_text and both_text:
             if event.text:
                 existing.text = _append_text(existing.text, event.text)
+            existing.absorb(event)
             return
     pending_messages[session_key] = event
 
@@ -2484,6 +2486,7 @@ class BasePlatformAdapter(ABC):
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
+            existing.absorb(event)
         existing._last_chunk_len = len(event.text or "")  # type: ignore[attr-defined]
         prior_task = self._pending_text_batch_tasks.get(key)
         if prior_task and not prior_task.done():
@@ -3753,6 +3756,7 @@ class BasePlatformAdapter(ABC):
         else:
             if event.text:
                 state.event.text = _append_text(state.event.text, event.text)
+            state.event.absorb(event)
             latest_message_id = getattr(event, "message_id", None)
             latest_anchor = latest_message_id or getattr(event, "reply_to_message_id", None)
             if latest_message_id is not None:
@@ -3915,6 +3919,16 @@ class BasePlatformAdapter(ABC):
                     self._release_session_guard(session_key, guard=command_guard)
             raise
         await self._drain_pending_after_session_command(session_key, command_guard)
+
+    def hold_for_restart(self, event: MessageEvent) -> bool:
+        """Give an inbound message back to the platform while the gateway drains for a restart.
+
+        True means the platform still holds a durable copy and will deliver this message again
+        after the next start, so the gateway answers it then instead of refusing it now. Only
+        adapters that replay from a durable source (a relay cursor, a server-side update queue)
+        can say yes; the default keeps today's refusal.
+        """
+        return False
 
     async def handle_message(self, event: MessageEvent) -> None:
         """Process an incoming message; returns quickly by spawning a background

@@ -80,6 +80,28 @@ class GatewayBusySessionMixin:
         mode = busy_input_mode or self._busy_input_mode
         return self._restart_requested and mode in {"queue", "steer"}
 
+    def _hold_for_restart(self, event: MessageEvent) -> bool:
+        """Hand a message the drain would refuse or drop back to its platform (True = held).
+
+        A held message stays unconsumed at its source, and the adapter delivers it again after the
+        restart, so it is answered then. Commands and synthetic events are never held: a replayed
+        ``/restart`` or ``/stop`` would run again in the new process.
+        """
+        if getattr(event, "internal", False) or event.get_command():
+            return False
+        adapter = self._delivery_adapter_for(event.source)
+        if adapter is None:
+            return False
+        parts = event.parts()
+        held = [part for part in parts if adapter.hold_for_restart(part)]
+        if held and len(held) < len(parts):
+            logger.warning("Held %d of %d merged message(s) for %s; the rest can't be replayed",
+                           len(held), len(parts), self._status_action_label())
+        return len(held) == len(parts)
+
+    def _held_for_restart_notice(self) -> str:
+        return f"⏳ Gateway is {self._status_action_gerund()} — I'll answer this when it's back."
+
     def _overflow_queue(self, session_key: str):
         """The session's FIFO overflow list, or None when no session state exists yet."""
         state = self._peek_session_state(session_key)
@@ -489,7 +511,9 @@ class GatewayBusySessionMixin:
         adapter = self._delivery_adapter_for(event.source)
         if not adapter:
             return
-        if self._queue_during_drain_enabled(effective_mode):
+        if self._hold_for_restart(event):
+            message = self._held_for_restart_notice()
+        elif self._queue_during_drain_enabled(effective_mode):
             self._queue_or_replace_pending_event(session_key, event)
             message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
         else:
