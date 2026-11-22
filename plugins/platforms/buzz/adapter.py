@@ -98,6 +98,7 @@ def _escape_unresolved_presentation_mention(content: str, error: str) -> Optiona
 
 _FETCH_LIMIT = 50  # events per poll / seed call
 _SEEN_CAP = 500  # per-channel de-dupe set bound (events)
+_REPLAY_TTL = 6 * 3600  # a message held for a restart that no later start has re-read in 6 h is let go
 _CURSOR_STATE_SUBDIR = "buzz"  # per-channel cursors survive a restart under HERMES_HOME
 _CURSOR_STATE_FILENAME = "channel-cursors.json"
 _DM_DISCOVERY_EVERY = 5  # re-run DM discovery every N poll sweeps
@@ -1302,9 +1303,9 @@ class BuzzAdapter(BasePlatformAdapter):
 
     def _new_channel_state(self, chat_type: str) -> dict:
         # ``held``: event id -> created_at for messages handed back during a restart drain (see hold_for_restart);
-        # ``replay``: ids a previous process held, which passed the mention gate there and are owed an answer.
+        # ``replay``: id -> created_at a previous process held; it passed the mention gate there and is owed an answer.
         return {"chat_type": chat_type, "last_ts": 0, "seen": OrderedDict(), "event_meta": OrderedDict(), "held": {},
-                "replay": set()}
+                "replay": {}}
 
     # ── Durable channel cursors ───────────────────────────────────────────
 
@@ -1336,7 +1337,10 @@ class BuzzAdapter(BasePlatformAdapter):
                 continue
             raw_seen, raw_held = entry.get("seen"), entry.get("held")
             seen = [str(event_id) for event_id in raw_seen][-_SEEN_CAP:] if isinstance(raw_seen, list) else []
-            held = {str(event_id) for event_id in raw_held} if isinstance(raw_held, list) else set()
+            held = {}
+            for event_id, held_ts in (raw_held.items() if isinstance(raw_held, dict) else ()):
+                with contextlib.suppress(TypeError, ValueError):
+                    held[str(event_id)] = int(held_ts)
             self._restored_cursors[str(channel_id)] = {"chat_type": str(entry.get("chat_type") or ""), "last_ts": last_ts,
                                                        "seen": seen, "held": held}
 
@@ -1348,14 +1352,15 @@ class BuzzAdapter(BasePlatformAdapter):
         """
         channels = {}
         for channel_id, state in self._channel_state.items():
-            held = state.get("held") or {}
+            # owed an answer: held here, or held by a previous process and not yet re-read. The next process
+            # re-reads from the oldest and skips the mention gate for these (it may not know the reply parent).
+            held = {**(state.get("replay") or {}), **(state.get("held") or {})}
             last_ts = int(state.get("last_ts") or 0)
             channels[channel_id] = {
                 "chat_type": state.get("chat_type") or "group",
                 "last_ts": min(last_ts, *held.values()) if held else last_ts,
                 "seen": [event_id for event_id in state.get("seen") or () if event_id not in held],
-                # owed an answer: the next process skips the mention gate for these (it may not know the reply parent)
-                "held": sorted(set(held) | set(state.get("replay") or ())),
+                "held": held,
             }
         payload = {"identity": self._self_pubkey, "relay": self.relay_url, "channels": channels}
         try:
@@ -1404,7 +1409,9 @@ class BuzzAdapter(BasePlatformAdapter):
         state = self._new_channel_state(restored["chat_type"] or chat_type)
         state["last_ts"] = restored["last_ts"]
         state["seen"] = OrderedDict((event_id, None) for event_id in restored["seen"])
-        state["replay"] = set(restored.get("held") or ()) - set(state["seen"])
+        cutoff = time.time() - _REPLAY_TTL
+        state["replay"] = {event_id: held_ts for event_id, held_ts in (restored.get("held") or {}).items()
+                           if held_ts >= cutoff and event_id not in state["seen"]}
         self._channel_state[channel_id] = state
         return True
 
@@ -1639,6 +1646,7 @@ class BuzzAdapter(BasePlatformAdapter):
         if not event_id or event_id in state["seen"]:
             return
         state["seen"][event_id] = None
+        owed = state.setdefault("replay", {}).pop(event_id, None) is not None
         state["last_ts"] = max(state["last_ts"], created_at)
         if int(event.get("kind") or 0) not in _DISPATCH_KINDS:
             return
@@ -1661,8 +1669,6 @@ class BuzzAdapter(BasePlatformAdapter):
         # Channels dispatch only when addressed (@mention or p-tag) or replying to us (Signal/WhatsApp parity),
         # unless require_mention is off. DMs always dispatch.
         # A message held by the previous process passed this gate there; a restored cursor may not know its reply parent.
-        owed = event_id in state.get("replay", ())
-        state.get("replay", set()).discard(event_id)
         if not is_dm and self.require_mention and not owed and not self._is_addressed(event) and not reply_to_is_own:
             return
         # Adapter-level allow-list (gateway also applies it centrally); empty = no filter.

@@ -9,6 +9,7 @@ Real ``BuzzAdapter`` and real ``GatewayRunner`` drain gates, two adapter lives s
 """
 
 import asyncio
+import time
 
 import pytest
 from unittest.mock import AsyncMock
@@ -25,6 +26,7 @@ SELF_NPUB = "npub1nl2u0wnd8mezfknc74q7pl9ec58h9nrrakce4tnk434qgaxl4psqe5twr6"
 SENDER = "a" * 64
 CHANNEL = "ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd"
 REFUSAL = "not accepting"
+T0 = int(time.time()) - 3600  # held messages expire after hours, so the made-up history is recent
 
 
 class FakeRelay:
@@ -35,7 +37,7 @@ class FakeRelay:
         self.sent = []
 
     def post(self, event_id, content, created_at):
-        self.events.append({"id": event_id, "pubkey": SENDER, "content": content, "created_at": created_at,
+        self.events.append({"id": event_id, "pubkey": SENDER, "content": content, "created_at": T0 + created_at,
                             "kind": 9, "tags": [["h", CHANNEL], ["p", SELF_PUBKEY]]})
 
     async def __call__(self, args, *, input_text=None):
@@ -181,9 +183,7 @@ async def test_follow_ups_queued_before_the_drain_are_all_held(home, head):
     await _start(second)
     await second._poll_channel(CHANNEL)
     await _settle(second)
-    if head == "a slash command":
-        answered = [event_id for event_id in answered if event_id in expected]  # q1, q2 were never queued
-    assert sorted(answered) == expected
+    assert sorted(answered) == expected  # and nothing life 1 already took is answered twice
 
 
 @pytest.mark.asyncio
@@ -201,7 +201,7 @@ async def test_a_part_that_cannot_be_replayed_holds_nothing(home):
 
     assert adapter.hold_for_restart([good, no_copy]) is False
     saved = json.loads((home / "buzz" / "channel-cursors.json").read_text())["channels"][CHANNEL]
-    assert "ok" in saved["seen"] and saved["last_ts"] == 400
+    assert "ok" in saved["seen"] and saved["last_ts"] == T0 + 400
 
 
 @pytest.mark.asyncio
@@ -210,12 +210,12 @@ async def test_a_held_reply_to_the_bot_without_a_mention_is_answered_after_resta
     so it no longer knows whose post the parent was. The hold must still be kept."""
     relay = FakeRelay()
     relay.events.append({"id": "bot-post", "pubkey": SELF_PUBKEY, "content": "Done: the report is up.",
-                         "created_at": 100, "kind": 9, "tags": [["h", CHANNEL]]})
+                         "created_at": T0 + 100, "kind": 9, "tags": [["h", CHANNEL]]})
     first = _adapter(relay)
     await _start(first)  # seeded from history: knows bot-post is ours
     runner = _draining_runner(first)
     first.set_message_handler(runner._handle_message)
-    relay.events.append({"id": "reply", "pubkey": SENDER, "content": "thanks, one question", "created_at": 200,
+    relay.events.append({"id": "reply", "pubkey": SENDER, "content": "thanks, one question", "created_at": T0 + 200,
                          "kind": 9, "tags": [["h", CHANNEL], ["e", "bot-post", "", "reply"]]})
     await first._poll_channel(CHANNEL)
     await _settle(first)
@@ -233,3 +233,35 @@ async def test_a_held_reply_to_the_bot_without_a_mention_is_answered_after_resta
     await second._poll_channel(CHANNEL)
     await _settle(second)
     assert answered == ["reply"]
+
+
+@pytest.mark.asyncio
+async def test_a_held_message_survives_a_second_restart_before_it_is_read(home):
+    """Life 2 sees only newer traffic (a websocket delivers it first) and restarts; life 3 still owes the answer."""
+    relay = FakeRelay()
+    first = _adapter(relay)
+    await _start(first)
+    first.set_message_handler(_draining_runner(first)._handle_message)
+    relay.post("held", "@Chip still there?", 200)
+    await first._poll_channel(CHANNEL)
+    await _settle(first)
+    await first.disconnect()
+
+    relay.post("newer", "chatter", 300)
+    second = _adapter(relay)
+    second.set_message_handler(AsyncMock())
+    await _start(second)
+    await second._handle_events(CHANNEL, second._channel_state[CHANNEL], [relay.events[-1]])
+    await second.disconnect()
+
+    third = _adapter(relay)
+    answered = []
+
+    async def gateway(event: MessageEvent):
+        answered.append(event.message_id)
+
+    third.set_message_handler(gateway)
+    await _start(third)
+    await third._poll_channel(CHANNEL)
+    await _settle(third)
+    assert answered == ["held"]
