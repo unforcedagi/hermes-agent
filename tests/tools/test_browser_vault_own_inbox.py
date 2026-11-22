@@ -245,9 +245,33 @@ def test_a_code_is_claimed_once_and_a_failed_fill_gives_it_back(mailbox):
     mailbox.messages = [{"from": "no-reply@acme.test", "subject": "Code", "body": "Your code is 318264", "at": time.time() - 30}]
     code, err, claim = own.fetch_code(INBOX, "acme.test", 0, cfg)
     assert code == "318264" and err is None and len(own._used) == 1  # the old keys went with the request
-    assert own.fetch_code(INBOX, "acme.test", 0, cfg) == (None, None, None)  # claimed: the other session waits
+    assert own.fetch_code(INBOX, "acme.test", 0, cfg) == (None, None, None)  # claimed: the reader skips it now
     own.release(claim)
     assert own.fetch_code(INBOX, "acme.test", 0, cfg)[0] == "318264"
+
+
+def test_two_sessions_reading_one_mail_type_it_once(mailbox, monkeypatch):
+    """Both sessions' requests reached the reader before either claimed (so it answered both with the same mail):
+    only the first types it; the second keeps waiting for the next mail, then says none came."""
+    at = time.time() - 30
+    same = json.dumps({"candidates": [{"code": "482913", "received_at": at, "from": "no-reply@acme.test"}]})
+    cfg = {**own.own_inbox_config(), "socket": _canned(same)[0]}
+    first = own.fetch_code(INBOX, "acme.test", 0, cfg)
+    started = time.monotonic()
+    second = own.fetch_code(INBOX, "acme.test", 3, cfg)
+    assert first[0] == "482913" and second == (None, None, None) and time.monotonic() - started >= 1.5
+
+
+def test_a_fill_that_throws_gives_the_code_back(mailbox):
+    mailbox.messages = [{"from": "no-reply@acme.test", "subject": "Code", "body": "Your code is 318264", "at": time.time() - 30}]
+    with patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None), \
+         patch.object(browser_vault_tool, "_eval_js", side_effect=lambda t, e: {"success": True, "result": json.dumps(OTP_BOX) if "querySelectorAll" in e else "https://acme.test/2fa"}), \
+         patch.object(browser_vault_tool, "_eval_js_secret", side_effect=RuntimeError("supervisor went away")), \
+         pytest.raises(RuntimeError):
+        browser_vault_tool.browser_vault_enter_code(task_id="t", source="own_inbox", wait_s=0, site="https://acme.test", sender="acme.test")
+    assert own._used == {}
+    out, _, typed = _enter(site="https://acme.test", sender="acme.test")
+    assert out["success"] and typed == ["318264"]
 
 
 def test_a_resent_mail_with_the_same_code_is_typed_again(mailbox):

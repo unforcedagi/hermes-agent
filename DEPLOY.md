@@ -45,7 +45,10 @@ git push fork plugin-inject-origin       # fork only; no upstream PR
 ```
 
 Then the admin's setup check, which compares the installed reader with the merged file:
-`sudo <setup repo>/s2-70-own-inbox-reader.sh check` (all pass; before the merge it reports "reader differs").
+`sudo <setup repo>/s2-70-own-inbox-reader.sh check` (all pass; before the merge it reports "reader differs"). The
+installed reader already is this branch's, and the reader and Hermes must match (both key a used code by inbox, code
+and the mail's time): if the merged file differs, run `... apply` before the gateway restart. `apply` refuses a
+reader from before the socket, so running it before the merge can't install the old one.
 
 ## Config (Uni edits `~/.hermes/config.yaml`)
 

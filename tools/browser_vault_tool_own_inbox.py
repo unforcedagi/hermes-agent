@@ -178,9 +178,9 @@ def _read(sock_path: str, inbox: str, sender: str, wait_s: int) -> Tuple[Optiona
     return {"code": code, "received_at": received_at}, None
 
 
-def used_key(code: str, received_at: float) -> str:
+def used_key(inbox: str, code: str, received_at: float) -> str:
     """The skip key for one message's code; the reader computes the same."""
-    return hashlib.sha256(f"{code}@{int(received_at)}".encode()).hexdigest()
+    return hashlib.sha256(f"{inbox}:{code}@{int(received_at)}".encode()).hexdigest()
 
 
 def fetch_code(inbox: str, sender: str, wait_s: int,
@@ -188,17 +188,20 @@ def fetch_code(inbox: str, sender: str, wait_s: int,
     """``(code, None, claim)``: the newest unused code in ``inbox`` from the last 10 minutes, waiting up to ``wait_s``
     for one to arrive, already claimed (no other session gets it; ``release(claim)`` if it was not typed);
     ``(None, error, None)`` otherwise. The code is returned to the caller only, never logged."""
-    newest, err = _read(str(cfg.get("socket") or "").strip(), inbox, sender, max(0, min(int(wait_s), _MAX_WAIT_S)))
-    if err or newest is None:
-        return None, err, None
-    if time.time() - newest["received_at"] > MAX_AGE_S:
-        return None, None, None
-    claim = used_key(newest["code"], newest["received_at"])
-    with _used_lock:
-        if claim in _used:
+    deadline = time.monotonic() + max(0, min(int(wait_s), _MAX_WAIT_S))
+    while True:
+        left = max(0.0, deadline - time.monotonic())
+        newest, err = _read(str(cfg.get("socket") or "").strip(), inbox, sender, int(left))
+        if err or newest is None or time.time() - newest["received_at"] > MAX_AGE_S:
+            return None, err, None
+        claim = used_key(inbox, newest["code"], newest["received_at"])
+        with _used_lock:
+            if claim not in _used:
+                _used[claim] = newest["received_at"]
+                return newest["code"], None, claim
+        if left <= 1:  # another session claimed this one in the meantime: wait for the next mail, if time is left
             return None, None, None
-        _used[claim] = newest["received_at"]
-    return newest["code"], None, claim
+        time.sleep(1)  # the reader skips the claim now; a second apart, so one that can't (an older copy) isn't hammered
 
 
 def release(claim: Optional[str]) -> None:

@@ -554,16 +554,19 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, se
             return _unstamp(effective_task_id, {"success": False, "error_type": "code_declined",
                                "error": "The user did not enter a code. Do not ask again this turn."})
 
-    register_vault_redaction_value(code)
-    fills = build_otp_fills(otp_controls, code)
-    result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
-    parsed = _parse_json_result(result.get("result")) if result.get("success") else None
-    if isinstance(parsed, str):
-        parsed = _parse_json_result(parsed)
-    filled = int(parsed.get("filled", 0)) if isinstance(parsed, dict) else 0
+    filled = 0
+    try:
+        register_vault_redaction_value(code)
+        fills = build_otp_fills(otp_controls, code)
+        result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
+        parsed = _parse_json_result(result.get("result")) if result.get("success") else None
+        if isinstance(parsed, str):
+            parsed = _parse_json_result(parsed)
+        filled = int(parsed.get("filled", 0)) if isinstance(parsed, dict) else 0
+    finally:
+        if source == "own_inbox" and not filled:
+            own.release(claim)  # not typed: the next call may use this message's code
     if source == "own_inbox":
-        if not filled:
-            own.release(claim)
         own.audit("entered" if filled else "fill failed", origin, basis, inbox, sender)
     del code
     if not result.get("success"):
