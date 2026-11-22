@@ -19,7 +19,8 @@ nothing done) while any user unit has unloaded changes, since the reload would l
   scores back to 200; the T-335 core guard stays).
 - Takes effect: oomd marks, heavy.slice's kill rule and OOMPolicy at daemon-reload; OOMScoreAdjust at the next start
   of each unit (apply's choom covers the processes already running).
-- Proof it works, on throwaway units: `~/Code/uni-ops/memory/pressure-test` (about 2 min, never touches live units).
+- Proof it works, on throwaway units: `~/Code/uni-ops/memory/pressure-test` (5–8 min, never touches live units; run
+  it when the box is quiet, its oomd verdicts depend on load).
 - Trade-off to know: `omit` also covers the gateway's tool subprocesses, so a runaway tool under the gateway is left
   to the kernel (which still takes it first) while oomd takes Matrix or core.
 - Trade-off to know: a burst of workers that holds heavy.slice at its 64G ceiling until 30% stalled now loses its

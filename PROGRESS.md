@@ -28,4 +28,4 @@
   every reload. apply --undo reverts only what apply set.
 
 ## Next
-- Final review + /verify; report. Nothing applied live (Uni runs memory/apply; Aaron restarts the gateway).
+- Done: sixth review clean; final verify ran (see report). Report. Nothing applied live (Uni runs memory/apply; Aaron restarts the gateway).
