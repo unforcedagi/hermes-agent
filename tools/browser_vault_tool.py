@@ -535,7 +535,7 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, se
             inbox, basis, refusal = own.gate(own_cfg, inbox, sender, origin, allowed, named_site)
             if refusal:
                 return _unstamp(effective_task_id, refusal)
-        code, err = own.fetch_code(inbox, sender, wait_s, own_cfg)
+        code, err, claim = own.fetch_code(inbox, sender, wait_s, own_cfg)
         if not code:
             own.audit("not found" if not err else "reader failed", origin, basis, inbox, sender)
             return _unstamp(effective_task_id, {"success": False, "error_type": "no_code_found" if not err else "reader_failed",
@@ -562,8 +562,8 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, se
         parsed = _parse_json_result(parsed)
     filled = int(parsed.get("filled", 0)) if isinstance(parsed, dict) else 0
     if source == "own_inbox":
-        if filled:
-            own.mark_used(code)
+        if not filled:
+            own.release(claim)
         own.audit("entered" if filled else "fill failed", origin, basis, inbox, sender)
     del code
     if not result.get("success"):

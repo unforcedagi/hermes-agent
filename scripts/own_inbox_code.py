@@ -16,7 +16,7 @@ mail server is contacted, whatever the request says:
   --agentmail  an AgentMail inbox: CURL_CONFIG is a curl config with the API's Authorization header.
 
 Request, one JSON line: {"address": "...", "sender": "acme.com | no-reply@acme.com", "max_age_s": 600,
-                         "wait_s": 60, "skip": ["<sha256 of a code already used>", ...]}
+                         "wait_s": 60, "skip": ["<sha256 of 'code@received_at' already used>", ...]}
   No other key is accepted. sender: a domain (two labels at least, not a free-mail one) matches mail From that domain
   or its subdomains; an address matches only itself. Only the From address counts, never its display name.
   The newest message from the sender holding a code is the answer. If its code is in ``skip`` (or there is none yet),
@@ -330,7 +330,7 @@ def serve(args: argparse.Namespace, line: bytes, uid: Optional[int]) -> int:
         settle = 0  # after a push the new mail can take a moment to become searchable: a few quick re-queries
         while True:
             found = candidates(messages(time.time() - max_age), sender, time.time() - max_age)
-            if found and hashlib.sha256(found[0]["code"].encode()).hexdigest() in skip:
+            if found and hashlib.sha256(f"{found[0]['code']}@{int(found[0]['received_at'])}".encode()).hexdigest() in skip:
                 found = []  # the newest code was already used: only a newer mail can answer
             left = deadline - time.monotonic()
             if found or left <= 0:

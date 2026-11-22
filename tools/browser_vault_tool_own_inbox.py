@@ -8,8 +8,9 @@ page over the supervisor socket like every vault secret, and never reaches the t
 transcript. Limits, all enforced here:
 
 - only the inboxes listed in ``vault.own_inbox.addresses`` (the reader also refuses any inbox it holds no key for);
-- only the NEWEST message holding a code, received in the last 10 minutes, and each code at most once per process
-  (a used code means "wait for the next mail", never "fall back to an older one" a resend has replaced);
+- only the NEWEST message holding a code, received in the last 10 minutes, and each message's code at most once
+  per process, claimed before it is typed (a used code means "wait for the next mail", never "fall back to an older
+  one" a resend has replaced);
 - the agent names the ``sender`` (a From domain or address, never a substring), so another site's newer code is
   never the one typed;
 - the page's origin must be bound to the saved login, listed in ``vault.own_inbox.origins``, or named by the agent
@@ -32,10 +33,10 @@ logger = logging.getLogger(__name__)
 MAX_AGE_S = 600
 _MAX_WAIT_S = 120
 _CODE = re.compile(r"[0-9]{4,8}")  # what a reader may hand back: anything else is refused, never typed
-# sha256 of each code entered -> when. Process-wide on purpose: the inboxes belong to the machine, not to a profile,
-# and a code typed by one profile must not be typed again by another. Kept a day (a mail stamped minutes in the future
-# stays answerable past the 10 minutes), then forgotten, so a long-lived gateway's skip list stays small.
-_USED_FOR_S = 86400
+# Codes taken from a mail, keyed by sha256 of "code@received_at" -> received_at: one message's code is typed once (a
+# resend of the same code in a new mail is a new key), and is claimed before it is typed so two sessions never type
+# the same one. Process-wide on purpose: the inboxes belong to the machine, not to a profile. A key is dropped once its
+# mail is older than the reader's window, so the list holds minutes of mail, however long the gateway runs.
 _used: Dict[str, float] = {}
 _used_lock = threading.Lock()
 _warned_reader: set = set()  # profile homes already told that vault.own_inbox.reader is retired
@@ -177,30 +178,40 @@ def _read(sock_path: str, inbox: str, sender: str, wait_s: int) -> Tuple[Optiona
     return {"code": code, "received_at": received_at}, None
 
 
-def fetch_code(inbox: str, sender: str, wait_s: int, cfg: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
-    """``(code, None)``: the newest unused code in ``inbox`` from the last 10 minutes, waiting up to ``wait_s`` for
-    one to arrive; ``(None, error)`` otherwise. The code is returned to the caller only, never logged."""
+def used_key(code: str, received_at: float) -> str:
+    """The skip key for one message's code; the reader computes the same."""
+    return hashlib.sha256(f"{code}@{int(received_at)}".encode()).hexdigest()
+
+
+def fetch_code(inbox: str, sender: str, wait_s: int,
+               cfg: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """``(code, None, claim)``: the newest unused code in ``inbox`` from the last 10 minutes, waiting up to ``wait_s``
+    for one to arrive, already claimed (no other session gets it; ``release(claim)`` if it was not typed);
+    ``(None, error, None)`` otherwise. The code is returned to the caller only, never logged."""
     newest, err = _read(str(cfg.get("socket") or "").strip(), inbox, sender, max(0, min(int(wait_s), _MAX_WAIT_S)))
     if err or newest is None:
-        return None, err
+        return None, err, None
+    if time.time() - newest["received_at"] > MAX_AGE_S:
+        return None, None, None
+    claim = used_key(newest["code"], newest["received_at"])
     with _used_lock:
-        used = hashlib.sha256(newest["code"].encode()).hexdigest() in _used
-    if time.time() - newest["received_at"] > MAX_AGE_S or used:
-        return None, None
-    return newest["code"], None
+        if claim in _used:
+            return None, None, None
+        _used[claim] = newest["received_at"]
+    return newest["code"], None, claim
+
+
+def release(claim: Optional[str]) -> None:
+    """Give back a claimed code that was not typed (the fill failed), so the next call can use it."""
+    with _used_lock:
+        _used.pop(claim or "", None)
 
 
 def _forget_old_codes() -> None:
-    """Drop codes used more than a day ago (call with ``_used_lock`` held)."""
-    cutoff = time.time() - _USED_FOR_S
+    """Drop keys whose mail the reader can no longer return (call with ``_used_lock`` held)."""
+    cutoff = time.time() - MAX_AGE_S - _MAX_WAIT_S
     for h in [h for h, at in _used.items() if at < cutoff]:
         del _used[h]
-
-
-def mark_used(code: str) -> None:
-    with _used_lock:
-        _forget_old_codes()
-        _used[hashlib.sha256(code.encode()).hexdigest()] = time.time()
 
 
 OWN_INBOX_PROPERTIES = {

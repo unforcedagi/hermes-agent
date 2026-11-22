@@ -237,14 +237,28 @@ def test_reader_takes_only_its_one_request_shape(mailbox, request_):
     assert reply["error"].startswith("malformed request") and mailbox.requests == 0
 
 
-def test_codes_used_long_ago_are_not_sent_again(mailbox):
-    """A long-lived gateway: thousands of codes used days ago never grow the request past the reader's cap."""
-    old = time.time() - 3 * 86400
-    own._used.update({f"{i:064x}": old for i in range(5000)})
+def test_a_code_is_claimed_once_and_a_failed_fill_gives_it_back(mailbox):
+    """Two sessions asking at once never both get one message's code; a code that was not typed is not burnt; and a
+    long-lived gateway's skip list holds only mail the reader could still return."""
+    cfg = own.own_inbox_config()
+    own._used.update({f"{i:064x}": time.time() - 3 * 86400 for i in range(5000)})  # codes from days ago
     mailbox.messages = [{"from": "no-reply@acme.test", "subject": "Code", "body": "Your code is 318264", "at": time.time() - 30}]
-    out, _, typed = _enter(site="https://acme.test", sender="acme.test")
-    assert out["success"] and typed == ["318264"]
-    assert len(own._used) == 1  # entering a code forgets the ones the reader can no longer return
+    code, err, claim = own.fetch_code(INBOX, "acme.test", 0, cfg)
+    assert code == "318264" and err is None and len(own._used) == 1  # the old keys went with the request
+    assert own.fetch_code(INBOX, "acme.test", 0, cfg) == (None, None, None)  # claimed: the other session waits
+    own.release(claim)
+    assert own.fetch_code(INBOX, "acme.test", 0, cfg)[0] == "318264"
+
+
+def test_a_resent_mail_with_the_same_code_is_typed_again(mailbox):
+    """Some sites resend the same code in a new mail: that mail is new, so its code is typed; the old one never is."""
+    mailbox.messages = [{"from": "no-reply@acme.test", "subject": "Code", "body": "Your code is 482913", "at": time.time() - 90}]
+    first, _, typed = _enter(site="https://acme.test", sender="acme.test")
+    again, _, _ = _enter(site="https://acme.test", sender="acme.test")
+    mailbox.messages.append({"from": "no-reply@acme.test", "subject": "Code", "body": "Your code is 482913", "at": time.time()})
+    resent, _, typed_resent = _enter(site="https://acme.test", sender="acme.test")
+    assert first["success"] and typed == ["482913"] and again["error_type"] == "no_code_found"
+    assert resent["success"] and typed_resent == ["482913"]
 
 
 def test_reader_answers_only_its_own_user(mailbox):
