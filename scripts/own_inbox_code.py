@@ -20,8 +20,9 @@ Request, one JSON line: {"address": "...", "sender": "acme.com | no-reply@acme.c
   No other key is accepted. sender: a domain (two labels at least, not a free-mail one) matches mail From that domain
   or its subdomains; an address matches only itself. Only the From address counts, never its display name.
   The newest message from the sender holding a code is the answer. If its code is in ``skip`` (or there is none yet),
-  the reader waits up to ``wait_s`` for new mail (JMAP: the server's push stream; AgentMail: every 5 s); it never
-  falls back to an older message, whose code a resend has replaced.
+  the reader waits up to ``wait_s`` for new mail (JMAP on its own account: the server's push stream; a shared Inbox,
+  which gets no push, and AgentMail: every 5 s); it never falls back to an older message, whose code a resend has
+  replaced.
 Reply, one JSON line: {"candidates": [{"code": "...", "received_at": <epoch>, "from": "..."}]} (at most one), or
                       {"error": "..."}. Nothing else is ever sent: no body, link or subject.
 Each request writes one audit line to stderr (the journal): who asked, which inbox and sender, and the outcome. Never
@@ -308,7 +309,7 @@ def serve(args: argparse.Namespace, line: bytes, uid: Optional[int]) -> int:
         return _reply({"error": "this reader answers only its own user"})
     try:
         req = parse_request(line)
-    except (ValueError, TypeError) as exc:
+    except Exception as exc:  # anything the JSON or the numbers can throw (OverflowError, RecursionError, ...)
         _audit(uid, "", "", "refused:request")
         return _reply({"error": f"malformed request: {str(exc)[:200]}"})
     address, sender = req["address"], req["sender"]

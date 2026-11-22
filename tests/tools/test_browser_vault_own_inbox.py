@@ -139,7 +139,7 @@ def mailbox(tmp_path, monkeypatch):
     path, srv = _reader_service(["--peer-uid", str(os.getuid()), *box.argv])
     cfg = {"socket": path, "addresses": [INBOX], "origins": []}
     monkeypatch.setattr(own, "own_inbox_config", lambda: cfg)
-    monkeypatch.setattr(own, "_used", set())
+    monkeypatch.setattr(own, "_used", {})
     yield box
     srv.close()
     shutil.rmtree(os.path.dirname(path), ignore_errors=True)
@@ -225,12 +225,25 @@ def test_reader_refuses_an_inbox_it_holds_no_key_for(mailbox, address):
 
 
 @pytest.mark.parametrize("request_", [
-    {"address": INBOX, "sender": "acme.test", "jmap_url": "https://evil.test"},  # no key but the five
-    {"address": INBOX, "sender": "acme.test", "skip": ["not-a-digest"]},
-])
+    json.dumps({"address": INBOX, "sender": "acme.test", "jmap_url": "https://evil.test"}),  # no key but the five
+    json.dumps({"address": INBOX, "sender": "acme.test", "skip": ["not-a-digest"]}),
+    '{"address": "%s", "sender": "acme.test", "wait_s": Infinity}' % INBOX,
+    "[" * 30000,  # under the size cap, deep enough to break the JSON parser
+], ids=["extra-field", "bad-skip", "infinity", "deep-nesting"])
 def test_reader_takes_only_its_one_request_shape(mailbox, request_):
-    reply = _ask_reader(own.own_inbox_config()["socket"], request_)
+    from tools.browser_vault_tool_own_inbox import _ask
+
+    reply = json.loads(_ask(own.own_inbox_config()["socket"], request_, 30))
     assert reply["error"].startswith("malformed request") and mailbox.requests == 0
+
+
+def test_codes_used_long_ago_are_not_sent_again(mailbox):
+    """A long-lived gateway: thousands of codes used hours ago never grow the request past the reader's cap."""
+    old = time.time() - 3 * 3600
+    own._used.update({f"{i:064x}": old for i in range(5000)})
+    mailbox.messages = [{"from": "no-reply@acme.test", "subject": "Code", "body": "Your code is 318264", "at": time.time() - 30}]
+    out, _, typed = _enter(site="https://acme.test", sender="acme.test")
+    assert out["success"] and typed == ["318264"]
 
 
 def test_reader_answers_only_its_own_user(mailbox):

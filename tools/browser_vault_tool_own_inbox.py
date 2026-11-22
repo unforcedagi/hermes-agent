@@ -31,7 +31,8 @@ logger = logging.getLogger(__name__)
 MAX_AGE_S = 600
 _MAX_WAIT_S = 120
 _CODE = re.compile(r"[0-9]{4,8}")  # what a reader may hand back: anything else is refused, never typed
-_used: set = set()  # sha256 of codes already entered: a stale code is never typed twice
+_used: Dict[str, float] = {}  # sha256 of each code entered -> when: a stale code is never typed twice
+_warned_reader = False
 
 
 def own_inbox_config() -> Dict[str, Any]:
@@ -50,6 +51,11 @@ def _list(value: Any) -> List[str]:
 def own_inbox_addresses(cfg: Optional[Dict[str, Any]] = None) -> List[str]:
     cfg = own_inbox_config() if cfg is None else cfg
     if not isinstance(cfg.get("socket"), str) or not cfg["socket"].strip():  # the reader service's unix socket
+        global _warned_reader
+        if cfg.get("reader") and not _warned_reader:
+            _warned_reader = True
+            logger.warning("vault.own_inbox.reader is no longer read (Hermes never runs a reader command): set "
+                           "vault.own_inbox.socket to the inbox reader service's socket; source=own_inbox is off")
         return []
     return [a.lower() for a in _list(cfg.get("addresses"))]
 
@@ -129,8 +135,9 @@ def _read(sock_path: str, inbox: str, sender: str, wait_s: int) -> Tuple[Optiona
     """``(newest, None)`` with the reader's newest ``{"code", "received_at"}`` (None when it found none), or
     ``(None, error)``. The reader does the waiting (on the mail server's push where it has one) and skips codes
     already used. Its output is checked, never trusted: anything malformed is an error, not a crash."""
+    recent = time.time() - MAX_AGE_S - _MAX_WAIT_S  # an older code can't be the reader's answer any more
     request = json.dumps({"address": inbox, "sender": sender, "max_age_s": MAX_AGE_S, "wait_s": wait_s,
-                          "skip": sorted(_used)})
+                          "skip": sorted(h for h, at in _used.items() if at > recent)})
     try:
         raw = _ask(sock_path, request, wait_s + 60)
     except OSError as exc:
@@ -167,7 +174,7 @@ def fetch_code(inbox: str, sender: str, wait_s: int, cfg: Dict[str, Any]) -> Tup
 
 
 def mark_used(code: str) -> None:
-    _used.add(hashlib.sha256(code.encode()).hexdigest())
+    _used[hashlib.sha256(code.encode()).hexdigest()] = time.time()
 
 
 OWN_INBOX_PROPERTIES = {

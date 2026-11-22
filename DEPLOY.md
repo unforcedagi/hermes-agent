@@ -28,7 +28,7 @@ Nothing live changes until Uni merges and the gateway restarts.
    reader opens only the inboxes named in its own root-owned unit, answers only Hermes's uid (SO_PEERCRED), takes
    only its five request fields, and queries only the account named by the inbox; the call names the `sender` (a From domain or
    address, so another site's newer code is never read); a used code means "wait for the next mail" (the reader
-   waits on Stalwart's push stream, up to `wait_s`); the page origin must be bound to the saved login,
+   checks every 5 s, up to `wait_s`: Stalwart sends no push for a shared Inbox, which is what its login reads); the page origin must be bound to the saved login,
    listed in `vault.own_inbox.origins`, or named in the call (`site`). Every attempt writes one
    `AUDIT vault own-inbox code <outcome>: origin=… basis=item|config|named inbox=… sender=…` line to `agent.log`.
    With no `vault.own_inbox.socket` the schema is unchanged: a config that still has the old `reader:` key and no
