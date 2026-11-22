@@ -31,8 +31,10 @@ logger = logging.getLogger(__name__)
 MAX_AGE_S = 600
 _MAX_WAIT_S = 120
 _CODE = re.compile(r"[0-9]{4,8}")  # what a reader may hand back: anything else is refused, never typed
-_used: Dict[str, float] = {}  # sha256 of each code entered -> when: a stale code is never typed twice
-_warned_reader = False
+# sha256 of each code entered -> when. Process-wide on purpose: the inboxes belong to the machine, not to a profile,
+# and a code typed by one profile must not be typed again by another. Entries older than the reader's window go.
+_used: Dict[str, float] = {}
+_warned_reader: set = set()  # profile homes already told that vault.own_inbox.reader is retired
 
 
 def own_inbox_config() -> Dict[str, Any]:
@@ -48,15 +50,23 @@ def _list(value: Any) -> List[str]:
     return [str(v).strip() for v in items if str(v).strip()]
 
 
+def _warn_retired_reader(cfg: Dict[str, Any], effect: str) -> None:
+    """Once per profile home: a config that still names the old reader command is told it is no longer read."""
+    from hermes_constants import hermes_home_key
+
+    home = hermes_home_key()
+    if cfg.get("reader") and home not in _warned_reader:
+        _warned_reader.add(home)
+        logger.warning("vault.own_inbox.reader is no longer read (Hermes never runs a reader command; the inbox reader "
+                       "is a service on vault.own_inbox.socket): %s. Remove the reader key.", effect)
+
+
 def own_inbox_addresses(cfg: Optional[Dict[str, Any]] = None) -> List[str]:
     cfg = own_inbox_config() if cfg is None else cfg
     if not isinstance(cfg.get("socket"), str) or not cfg["socket"].strip():  # the reader service's unix socket
-        global _warned_reader
-        if cfg.get("reader") and not _warned_reader:
-            _warned_reader = True
-            logger.warning("vault.own_inbox.reader is no longer read (Hermes never runs a reader command): set "
-                           "vault.own_inbox.socket to the inbox reader service's socket; source=own_inbox is off")
+        _warn_retired_reader(cfg, "source=own_inbox is off")
         return []
+    _warn_retired_reader(cfg, "the socket is used")
     return [a.lower() for a in _list(cfg.get("addresses"))]
 
 
@@ -174,7 +184,10 @@ def fetch_code(inbox: str, sender: str, wait_s: int, cfg: Dict[str, Any]) -> Tup
 
 
 def mark_used(code: str) -> None:
-    _used[hashlib.sha256(code.encode()).hexdigest()] = time.time()
+    now = time.time()
+    for h in [h for h, at in _used.items() if at < now - MAX_AGE_S - _MAX_WAIT_S]:
+        del _used[h]
+    _used[hashlib.sha256(code.encode()).hexdigest()] = now
 
 
 OWN_INBOX_PROPERTIES = {

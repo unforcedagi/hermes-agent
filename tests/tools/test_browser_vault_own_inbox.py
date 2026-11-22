@@ -244,6 +244,7 @@ def test_codes_used_long_ago_are_not_sent_again(mailbox):
     mailbox.messages = [{"from": "no-reply@acme.test", "subject": "Code", "body": "Your code is 318264", "at": time.time() - 30}]
     out, _, typed = _enter(site="https://acme.test", sender="acme.test")
     assert out["success"] and typed == ["318264"]
+    assert len(own._used) == 1  # entering a code forgets the ones the reader can no longer return
 
 
 def test_reader_answers_only_its_own_user(mailbox):
@@ -335,3 +336,13 @@ def test_a_busy_inbox_does_not_hide_the_sites_mail(mailbox):
                          for i in range(30)]  # thirty newer mails from other senders
     out, _, typed = _enter(site="https://acme.test", sender="acme.test")
     assert out["success"] and typed == ["318264"]
+
+
+def test_the_retired_reader_command_is_never_run_and_says_so_once(monkeypatch, caplog):
+    """A config from before the socket (a sudo reader command, no socket) switches the source off and warns once per
+    profile home; nothing is executed."""
+    monkeypatch.setattr(own, "_warned_reader", set())
+    cfg = {"reader": ["sudo", "-n", "/bin/false"], "addresses": [INBOX]}
+    with caplog.at_level(logging.WARNING, logger=own.__name__):
+        assert own.own_inbox_addresses(cfg) == [] and own.own_inbox_addresses(cfg) == []
+    assert caplog.text.count("vault.own_inbox.reader is no longer read") == 1
