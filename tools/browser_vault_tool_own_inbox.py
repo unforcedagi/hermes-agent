@@ -23,6 +23,7 @@ import json
 import logging
 import re
 import socket
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -32,8 +33,11 @@ MAX_AGE_S = 600
 _MAX_WAIT_S = 120
 _CODE = re.compile(r"[0-9]{4,8}")  # what a reader may hand back: anything else is refused, never typed
 # sha256 of each code entered -> when. Process-wide on purpose: the inboxes belong to the machine, not to a profile,
-# and a code typed by one profile must not be typed again by another. Entries older than the reader's window go.
+# and a code typed by one profile must not be typed again by another. Kept a day (a mail stamped minutes in the future
+# stays answerable past the 10 minutes), then forgotten, so a long-lived gateway's skip list stays small.
+_USED_FOR_S = 86400
 _used: Dict[str, float] = {}
+_used_lock = threading.Lock()
 _warned_reader: set = set()  # profile homes already told that vault.own_inbox.reader is retired
 
 
@@ -145,9 +149,10 @@ def _read(sock_path: str, inbox: str, sender: str, wait_s: int) -> Tuple[Optiona
     """``(newest, None)`` with the reader's newest ``{"code", "received_at"}`` (None when it found none), or
     ``(None, error)``. The reader does the waiting (on the mail server's push where it has one) and skips codes
     already used. Its output is checked, never trusted: anything malformed is an error, not a crash."""
-    recent = time.time() - MAX_AGE_S - _MAX_WAIT_S  # an older code can't be the reader's answer any more
-    request = json.dumps({"address": inbox, "sender": sender, "max_age_s": MAX_AGE_S, "wait_s": wait_s,
-                          "skip": sorted(h for h, at in _used.items() if at > recent)})
+    with _used_lock:
+        _forget_old_codes()
+        skip = sorted(_used)
+    request = json.dumps({"address": inbox, "sender": sender, "max_age_s": MAX_AGE_S, "wait_s": wait_s, "skip": skip})
     try:
         raw = _ask(sock_path, request, wait_s + 60)
     except OSError as exc:
@@ -178,16 +183,24 @@ def fetch_code(inbox: str, sender: str, wait_s: int, cfg: Dict[str, Any]) -> Tup
     newest, err = _read(str(cfg.get("socket") or "").strip(), inbox, sender, max(0, min(int(wait_s), _MAX_WAIT_S)))
     if err or newest is None:
         return None, err
-    if time.time() - newest["received_at"] > MAX_AGE_S or hashlib.sha256(newest["code"].encode()).hexdigest() in _used:
+    with _used_lock:
+        used = hashlib.sha256(newest["code"].encode()).hexdigest() in _used
+    if time.time() - newest["received_at"] > MAX_AGE_S or used:
         return None, None
     return newest["code"], None
 
 
-def mark_used(code: str) -> None:
-    now = time.time()
-    for h in [h for h, at in _used.items() if at < now - MAX_AGE_S - _MAX_WAIT_S]:
+def _forget_old_codes() -> None:
+    """Drop codes used more than a day ago (call with ``_used_lock`` held)."""
+    cutoff = time.time() - _USED_FOR_S
+    for h in [h for h, at in _used.items() if at < cutoff]:
         del _used[h]
-    _used[hashlib.sha256(code.encode()).hexdigest()] = now
+
+
+def mark_used(code: str) -> None:
+    with _used_lock:
+        _forget_old_codes()
+        _used[hashlib.sha256(code.encode()).hexdigest()] = time.time()
 
 
 OWN_INBOX_PROPERTIES = {

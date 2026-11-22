@@ -238,8 +238,8 @@ def test_reader_takes_only_its_one_request_shape(mailbox, request_):
 
 
 def test_codes_used_long_ago_are_not_sent_again(mailbox):
-    """A long-lived gateway: thousands of codes used hours ago never grow the request past the reader's cap."""
-    old = time.time() - 3 * 3600
+    """A long-lived gateway: thousands of codes used days ago never grow the request past the reader's cap."""
+    old = time.time() - 3 * 86400
     own._used.update({f"{i:064x}": old for i in range(5000)})
     mailbox.messages = [{"from": "no-reply@acme.test", "subject": "Code", "body": "Your code is 318264", "at": time.time() - 30}]
     out, _, typed = _enter(site="https://acme.test", sender="acme.test")
