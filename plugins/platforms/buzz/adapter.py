@@ -98,7 +98,7 @@ def _escape_unresolved_presentation_mention(content: str, error: str) -> Optiona
 
 _FETCH_LIMIT = 50  # events per poll / seed call
 _SEEN_CAP = 500  # per-channel de-dupe set bound (events)
-_REPLAY_TTL = 6 * 3600  # a message held for a restart that no later start has re-read in 6 h is let go
+_REPLAY_TTL = 6 * 3600  # a message held for a restart that no start has re-read 6 h after the hold is let go
 _CURSOR_STATE_SUBDIR = "buzz"  # per-channel cursors survive a restart under HERMES_HOME
 _CURSOR_STATE_FILENAME = "channel-cursors.json"
 _DM_DISCOVERY_EVERY = 5  # re-run DM discovery every N poll sweeps
@@ -1302,8 +1302,9 @@ class BuzzAdapter(BasePlatformAdapter):
                 logger.warning("Buzz: poll sweep failed", exc_info=True)
 
     def _new_channel_state(self, chat_type: str) -> dict:
-        # ``held``: event id -> created_at for messages handed back during a restart drain (see hold_for_restart);
-        # ``replay``: id -> created_at a previous process held; it passed the mention gate there and is owed an answer.
+        # ``held``: event id -> {"ts": created_at, "at": when held} for messages handed back during a restart drain
+        # (see hold_for_restart); ``replay``: the same for ones a previous process held. Those passed the mention
+        # gate there and are owed an answer.
         return {"chat_type": chat_type, "last_ts": 0, "seen": OrderedDict(), "event_meta": OrderedDict(), "held": {},
                 "replay": {}}
 
@@ -1338,27 +1339,29 @@ class BuzzAdapter(BasePlatformAdapter):
             raw_seen, raw_held = entry.get("seen"), entry.get("held")
             seen = [str(event_id) for event_id in raw_seen][-_SEEN_CAP:] if isinstance(raw_seen, list) else []
             held = {}
-            for event_id, held_ts in (raw_held.items() if isinstance(raw_held, dict) else ()):
-                with contextlib.suppress(TypeError, ValueError):
-                    held[str(event_id)] = int(held_ts)
+            for event_id, hold in (raw_held.items() if isinstance(raw_held, dict) else ()):
+                with contextlib.suppress(AttributeError, TypeError, ValueError):
+                    held[str(event_id)] = {"ts": int(hold["ts"]), "at": float(hold["at"])}
             self._restored_cursors[str(channel_id)] = {"chat_type": str(entry.get("chat_type") or ""), "last_ts": last_ts,
                                                        "seen": seen, "held": held}
 
     def _save_cursors(self) -> None:
         """Persist every watched channel's cursor.  Never raises.
 
-        A held message is written as not yet seen, and the cursor stops at it, so the next start fetches it
-        again; in this process it stays seen, so it isn't dispatched twice before the restart.
+        A held message is written as not yet seen, so the next start fetches it again (it resumes from the oldest
+        held message, see _restore_channel_state); in this process it stays seen, so it isn't dispatched twice before
+        the restart. ``last_ts`` stays the real high-water mark, so a hold that expires unread stops pinning it.
         """
-        channels = {}
+        cutoff = time.time() - _REPLAY_TTL
+        # A restored cursor for a conversation not adopted yet (DM discovery failed at boot) is kept as it was.
+        channels = {channel_id: {**entry, "seen": list(entry["seen"])}
+                    for channel_id, entry in self._restored_cursors.items() if channel_id not in self._channel_state}
         for channel_id, state in self._channel_state.items():
-            # owed an answer: held here, or held by a previous process and not yet re-read. The next process
-            # re-reads from the oldest and skips the mention gate for these (it may not know the reply parent).
-            held = {**(state.get("replay") or {}), **(state.get("held") or {})}
-            last_ts = int(state.get("last_ts") or 0)
+            # owed an answer: held here, or held by a previous process and not yet re-read.
+            held = {event_id: hold for event_id, hold in {**(state.get("replay") or {}), **(state.get("held") or {})}.items()
+                    if hold["at"] >= cutoff}
             channels[channel_id] = {
-                "chat_type": state.get("chat_type") or "group",
-                "last_ts": min(last_ts, *held.values()) if held else last_ts,
+                "chat_type": state.get("chat_type") or "group", "last_ts": int(state.get("last_ts") or 0),
                 "seen": [event_id for event_id in state.get("seen") or () if event_id not in held],
                 "held": held,
             }
@@ -1383,8 +1386,9 @@ class BuzzAdapter(BasePlatformAdapter):
             if not event_id or not created_at or state is None:
                 return False  # all or nothing: one message we can't replay and the caller refuses them all
             holds.append((state, event_id, created_at, event.source.chat_id))
+        held_at = time.time()
         for state, event_id, created_at, chat_id in holds:
-            state.setdefault("held", {})[event_id] = created_at
+            state.setdefault("held", {})[event_id] = {"ts": created_at, "at": held_at}
             logger.info("Buzz: holding message %s in %s until the gateway is back", event_id[:12],
                         self._channel_names.get(str(chat_id), chat_id))
         self._save_cursors()
@@ -1407,11 +1411,14 @@ class BuzzAdapter(BasePlatformAdapter):
         if restored is None:
             return False
         state = self._new_channel_state(restored["chat_type"] or chat_type)
-        state["last_ts"] = restored["last_ts"]
-        state["seen"] = OrderedDict((event_id, None) for event_id in restored["seen"])
         cutoff = time.time() - _REPLAY_TTL
-        state["replay"] = {event_id: held_ts for event_id, held_ts in (restored.get("held") or {}).items()
-                           if held_ts >= cutoff and event_id not in state["seen"]}
+        owed = {event_id: hold for event_id, hold in (restored.get("held") or {}).items() if hold["at"] >= cutoff}
+        # resume from the oldest message still owed an answer, so it is fetched again
+        state["last_ts"] = min([restored["last_ts"], *(hold["ts"] for hold in owed.values())])
+        state["seen"] = OrderedDict((event_id, None) for event_id in restored["seen"])
+        for event_id in set(restored.get("held") or ()) - set(owed):  # let go: never answered late
+            state["seen"][event_id] = None
+        state["replay"] = {event_id: hold for event_id, hold in owed.items() if event_id not in state["seen"]}
         self._channel_state[channel_id] = state
         return True
 

@@ -265,3 +265,33 @@ async def test_a_held_message_survives_a_second_restart_before_it_is_read(home):
     await third._poll_channel(CHANNEL)
     await _settle(third)
     assert answered == ["held"]
+
+
+@pytest.mark.asyncio
+async def test_an_expired_hold_stops_pinning_the_cursor(home, monkeypatch):
+    """A hold no start re-read within hours is let go: the next start resumes from where it really was, so it
+    neither answers the stale message nor re-reads (and re-answers) everything after it."""
+    relay = FakeRelay()
+    first = _adapter(relay)
+    await _start(first)
+    first.set_message_handler(_draining_runner(first)._handle_message)
+    relay.post("held", "@Chip still there?", 200)
+    relay.post("later", "chatter after it", 300)
+    await first._poll_channel(CHANNEL)
+    await _settle(first)
+    await first.disconnect()
+
+    real_time = time.time
+    monkeypatch.setattr(_buzz.time, "time", lambda: real_time() + 7 * 3600)
+    second = _adapter(relay)
+    answered = []
+
+    async def gateway(event: MessageEvent):
+        answered.append(event.message_id)
+
+    second.set_message_handler(gateway)
+    await _start(second)
+    assert second._channel_state[CHANNEL]["last_ts"] == T0 + 300
+    await second._poll_channel(CHANNEL)
+    await _settle(second)
+    assert answered == []
